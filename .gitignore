@@ -1,0 +1,29 @@
+# STM32CubeIDE 编译目录与中间文件
+Debug/
+Release/
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
+*.launch
+
+# Python 运行环境、缓存与日志
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+logs/
+*.log
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.cubeide-workspace/
+.DS_Store
+Thumbs.db
