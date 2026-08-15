@@ -3,11 +3,7 @@
 
 #include <string.h>
 
-/*
- * 传感器驱动只处理寄存器协议和通道整理，不直接控制板上的光源。
- * AS7341 使用手动 SMUX，AS7343 与 TCS3448 使用自动 SMUX；二者的原始数据
- * 最终都整理成按波段命名的连续通道，应用层无需了解 ADC 槽位顺序。
- */
+/* 传感器寄存器、SMUX 和通道映射。光源由应用层控制。 */
 
 #define ADDRESS_HAL(address_7bit)       ((uint16_t)((address_7bit) << 1))
 #define I2C_TIMEOUT_MS                  150U
@@ -101,10 +97,7 @@ static const uint16_t k_a3_channel_nm[14] =
     600U, 640U, 690U, 745U, 855U, 0U, 0U
 };
 
-/*
- * TCS3448 的寄存器协议与 AS7343 兼容，但量产标定的滤光峰值不同。
- * 单独保留通道元数据，避免上位机把 TCS3448 数据误标成 AS7343 波长。
- */
+/* TCS3448 与 AS7343 共用寄存器协议，通道峰值分别定义。 */
 static const char *const k_tcs3448_channel_names[14] =
 {
     "F1_407", "F2_424", "FZ_450", "F3_473", "F4_516",
@@ -131,9 +124,7 @@ static const uint16_t k_a3l_channel_nm[13] =
     600U, 640U, 690U, 745U, 855U, 0U
 };
 
-/*
- * AS7341 标准参考 SMUX 配置。每轮把四个滤光通道以及 CLEAR、NIR 接到六路 ADC。
- */
+/* AS7341 标准 SMUX：每轮四个滤光通道，加 CLEAR 和 NIR。 */
 static const uint8_t k_a1_smux_f1_f4[20] =
 {
     0x30U, 0x01U, 0x00U, 0x00U, 0x00U,
@@ -505,10 +496,7 @@ AS734X_Status_t AS734X_Detect(AS734X_Device_t *device,
     {
         address_39_ready = 1U;
 
-        /*
-         * 先检查 AS7341 的只读身份寄存器，避免在 AS7341 上试写 0xBF；
-         * 该地址在两套寄存器表中的含义不同。
-         */
+        /* 先检查 AS7341 ID；0xBF 在两套寄存器表中的含义不同。 */
         status_a1 = DetectAs7341Family(device);
         probe_92 = device->signature_92;
         if (status_a1 == AS734X_OK)
@@ -516,7 +504,7 @@ AS734X_Status_t AS734X_Detect(AS734X_Device_t *device,
             return AS734X_OK;
         }
 
-        /* 清除协议族暂存字段，但保留刚读到的 0x92 签名供诊断使用。 */
+        /* 清除协议暂存字段，保留 0x92 签名。 */
         device->model = AS734X_MODEL_NONE;
         device->protocol = AS734X_PROTOCOL_NONE;
         device->confidence = AS734X_CONFIDENCE_NONE;
@@ -573,10 +561,7 @@ AS734X_Status_t AS734X_Detect(AS734X_Device_t *device,
                          AS734X_CONFIDENCE_LOW : AS734X_CONFIDENCE_NONE;
     device->channel_count = 0U;
 
-    /*
-     * 身份校验失败时仍保留探测值。现场诊断需要用这些值区分“地址有应答但 ID
-     * 不认识”和“连线或地址不对”，不能被上面的清零操作一并抹掉。
-     */
+    /* 身份校验失败时保留探测值，供 DIAG 区分 ACK 与 ID 错误。 */
     if (address_39_ready != 0U)
     {
         device->signature_92 = probe_92;
@@ -1579,7 +1564,7 @@ const char *AS734X_ModelString(AS734X_Model_t model)
         case AS734X_MODEL_AS7341_FAMILY: return "AS7341_FAMILY";
         case AS734X_MODEL_AS7343_FAMILY: return "AS7343_FAMILY";
         case AS734X_MODEL_TCS3448:        return "TCS3448";
-        /* 地址已有应答（通常是 0x39 或 0x59），失败的是身份寄存器校验。 */
+        /* 地址有应答，但身份寄存器校验失败。 */
         case AS734X_MODEL_UNKNOWN_ADDRESS:return "UNKNOWN_ID";
         default:                         return "NONE";
     }

@@ -1,4 +1,4 @@
-# 固件编译与烧录教程
+# 固件编译与烧录
 
 [English](FIRMWARE_BUILD.md) · [返回中文首页](../README.zh-CN.md)
 
@@ -15,16 +15,16 @@
 1. 启动 STM32CubeIDE，在仓库外选择一个工作区。
 2. 选择 **File → Import → General → Existing Projects into Workspace**。
 3. 根目录选择 `firmware/stm32g030`。
-4. 导入 `ams_spectral_sensor_firmware`。如果希望修改直接保存在仓库里，不要勾选“Copy projects into workspace”。
+4. 导入 `ams_spectral_sensor_firmware`，不要勾选“Copy projects into workspace”。
 5. 选择 **Debug** 配置，执行 **Project → Build Project**。
 
-正常会得到：
+输出文件：
 
 ```text
 firmware/stm32g030/Debug/ams_spectral_sensor_firmware.elf
 ```
 
-当前源码已用 STM32CubeIDE 2.2.0 自带的 GNU Tools for STM32 14.3.rel1 编译。Debug 版本大约占 54.8 KB Flash、2.5 KB RAM；工具链版本不同产生少量差异是正常的。
+使用 STM32CubeIDE 2.2.0 / GNU Tools for STM32 14.3.rel1 编译时，Debug 版本约占 54.8 KB Flash、2.5 KB RAM。
 
 ## 用 STM32CubeIDE 烧录
 
@@ -38,7 +38,7 @@ firmware/stm32g030/Debug/ams_spectral_sensor_firmware.elf
 
 ## STM32CubeMX / `.ioc`
 
-`ams_spectral_sensor_firmware.ioc` 可以用 STM32CubeMX 打开，也可以直接在 STM32CubeIDE 中编辑。当前板级分配为：
+`ams_spectral_sensor_firmware.ioc` 可用 STM32CubeMX 或 STM32CubeIDE 编辑。板级分配如下：
 
 | 功能 | 外设 / 引脚 |
 |---|---|
@@ -51,9 +51,7 @@ firmware/stm32g030/Debug/ams_spectral_sensor_firmware.elf
 | 940 nm LED | PB0 |
 | NTC | ADC1 |
 
-应用代码集中在 `Core/Src/as734x.c`、`Core/Src/spectral_app.c` 及对应头文件；外设别名、GPIO 和稳定延时集中在 `Core/Inc/board_config.h`。
-
-用 CubeMX 重新生成代码前，应先提交或备份改动。`main.c` 等生成文件中的应用入口位于 CubeMX 用户代码区，但生成后仍要检查独立驱动文件和应用文件是否出现在差异中。
+应用代码位于 `Core/Src/as734x.c`、`Core/Src/spectral_app.c` 及对应头文件。外设别名、GPIO 和稳定延时位于 `Core/Inc/board_config.h`。
 
 ## 修改主板引脚
 
@@ -62,13 +60,4 @@ firmware/stm32g030/Debug/ams_spectral_sensor_firmware.elf
 3. 保持全部警告开启并重新编译。
 4. 按 `BOARD`、`LED CYCLE 500`、`TEMP`、`I2CSCAN`、`DETECT`、`MEASURE` 的顺序测试。
 
-务必确认 LED 有效电平。有效电平写反会导致本应采暗场时仍有光源亮着。
-
-## 版本号
-
-发布时修改 `Core/Inc/project_version.h`。只有报文格式或语义出现不兼容变化时，才修改 `PROJECT_PROTOCOL_VERSION`；本版仍为 `2.1`。同时更新根目录的 `CHANGELOG.md` 和 `VERSION.txt`。
-
-## 清理编译目录
-
-`Debug/`、`Release/` 已加入忽略规则。遇到旧依赖没有更新时，先执行 **Project → Clean** 再编译。ELF、HEX、BIN、map、list、目标文件、依赖文件、栈占用和复杂度文件都不应提交到仓库。
-
+LED 有效电平配置错误会使光源在暗场采集期间保持点亮。

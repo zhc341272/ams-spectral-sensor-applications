@@ -1,10 +1,10 @@
-# Sensor identification and channel mapping
+# Sensor identification and channels
 
 [中文](SENSOR_SUPPORT.zh-CN.md) · [Back to README](../README.md)
 
-## Detection strategy
+## Detection
 
-The driver never identifies a part from an ACK alone. It checks the expected address and read-only identity registers, restores bank selection after probing, and reports both the register-map family and candidate orderable parts.
+The firmware checks the I²C address and identity registers, then reports the register family, candidate parts, and channel profile.
 
 | Result | Evidence used | Default profile |
 |---|---|---|
@@ -14,16 +14,16 @@ The driver never identifies a part from an ACK alone. It checks the expected add
 | `UNKNOWN_ID` | ACK at a known address, identity value rejected | None |
 | `NONE` / I²C error | No valid ACK at either supported address | None |
 
-AS7341 is tested before the AS7343-style banked probe at `0x39`, avoiding an unsafe interpretation of register `0xBF` on an AS7341.
+At `0x39`, the AS7341 ID is checked before the AS7343 banked registers because register `0xBF` has different meanings in the two families.
 
-## Why the exact package can remain ambiguous
+## Part identity and channel profile
 
-AS7341 and AS7341L share the same digital identity family. AS7343 and AS7343L likewise share address/ID evidence while their optical interpretation can differ. Firmware therefore keeps two independent ideas:
+AS7341/AS7341L and AS7343/AS7343L may share addresses and digital IDs while using different channel maps. The firmware stores these separately:
 
-- **Detected family/candidates:** evidence from the physical device.
-- **Effective profile:** mapping used to label raw ADC slots.
+- **Candidates:** result from the address and identity registers.
+- **Channel profile:** mapping from ADC slots to channel names.
 
-`AUTO` selects the normal AS7341 or AS7343 mapping. A manually selected `L` profile is useful only when package marking, reel label, or purchasing records establish that part. The UI deliberately continues to show the candidate family after a manual selection.
+`AUTO` uses the standard AS7341 or AS7343 map. Select an `L` profile manually when the package marking, reel label, or purchasing record identifies that variant.
 
 ## Channel maps
 
@@ -42,7 +42,7 @@ AS7341 and AS7341L share the same digital identity family. AS7343 and AS7343L li
 | 8 | `CLEAR` | Not a single center wavelength |
 | 9 | `NIR_910` | 910 nm |
 
-The dedicated flicker engine is not mixed into this ordinary spectral array.
+Flicker-engine data is not part of this array.
 
 ### AS7343 — 14 reported values
 
@@ -65,7 +65,7 @@ The dedicated flicker engine is not mixed into this ordinary spectral array.
 
 ### TCS3448 — 14 reported values
 
-TCS3448 uses an AS7343-compatible register protocol, but its production-characterized filter peaks are not labeled as AS7343 values.
+TCS3448 uses the AS7343 register protocol with different channel peaks.
 
 | Index | Label | Nominal peak |
 |---:|---|---:|
@@ -84,13 +84,4 @@ TCS3448 uses an AS7343-compatible register protocol, but its production-characte
 | 12 | `CLEAR` | Not a single center wavelength |
 | 13 | `FD_RAW` | Raw flicker-photodiode count, not frequency |
 
-The desktop application does not hard-code the active table after connection. It rebuilds tables and plots from the firmware `CHANNELS` frame. Nominal wavelength plots intentionally exclude channels without one center wavelength, while the heatmap, value matrix, and CSV retain every channel.
-
-## Interpreting an unexpected chip
-
-- ACK at `0x39` with AS7341 ID evidence means the board wiring supports the shared `0x39` footprint, but does not prove AS7343 pin-level operation by itself.
-- ACK at `0x39` with `0x5A == 0x81` supports the AS7343 digital family, not necessarily AS7343 versus AS7343L.
-- ACK at `0x59` with `0x5A == 0x81` strongly supports TCS3448 in the implemented set.
-- `UNKNOWN_ID` means the address is responding but the known identity pattern is absent. Save `DIAG` output before changing firmware assumptions.
-- No ACK suggests power, reset, pull-up, soldering, orientation, pinout, or bus-level trouble before it suggests a new identity code.
-
+The desktop application rebuilds tables and plots from the firmware `CHANNELS` frame. Wavelength plots exclude `CLEAR` and `FD_RAW`; the heatmap, value table, and CSV retain all channels.

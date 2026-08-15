@@ -1,32 +1,18 @@
 AMS 光谱传感器应用 / AMS Spectral Sensor Applications
 
-固件版本: 2.3.0-ams-spectral-application
-串口协议: 2.1
-上位机版本: 3.0.0
-发布日期: 2026-08-16
-亮灯稳定延时: 50 ms
-关灯暗场稳定延时: 50 ms
-上位机界面: 系统默认 ttk 外观，默认中文，可切换英文；图表与 LED×波段实际值同屏
+固件 / Firmware: 2.3.0-ams-spectral-application
+串口协议 / Serial protocol: 2.1
+上位机 / Desktop application: 3.0.0
+日期 / Date: 2026-08-16
 
-正式支持器件:
-- AS7341: I2C 0x39, 10个常规光谱采样值（8个可见光滤光通道 + CLEAR + NIR；专用闪烁引擎不混入光谱数组）
-- AS7343: I2C 0x39, 14个上报值（12个滤光通道 + CLEAR + FD_RAW）
-- TCS3448: I2C 0x59, 14个上报值（12个滤光通道 + CLEAR + FD_RAW）
+支持 / Supported:
+- AS7341: 0x39, 10 channels
+- AS7343: 0x39, 14 channels
+- TCS3448: 0x59, 14 channels
 
-附加手动解析配置:
-- AS7341L、AS7343L（保留通道映射，未列入本项目三种正式支持器件）
+实机验证 / Hardware tested:
+- AS7341
+- TCS3448-compatible device (0x59, ID 0x81)
 
-已验证:
-- STM32CubeIDE 2.2.0 / GNU Tools for STM32 14.3.rel1 编译通过
-- STM32G030C8T6 烧录与校验通过
-- AS7341实机识别及10通道采样通过
-- TCS3448兼容器件实机识别及14通道采样通过
-- AS7343代码路径已实现，本版未获得可通信的AS7343样品实机验证
-
-English summary:
-- Firmware: 2.3.0-ams-spectral-application
-- Serial protocol: 2.1
-- Desktop application: 3.0.0
-- Release date: 2026-08-16
-- Official targets: AS7341, AS7343, TCS3448
-- Hardware verified: AS7341 and TCS3448; AS7343 driver path awaits a confirmed sample
+AS7343 驱动已完成，尚未实机验证。
+The AS7343 driver is implemented but has not been hardware tested.
