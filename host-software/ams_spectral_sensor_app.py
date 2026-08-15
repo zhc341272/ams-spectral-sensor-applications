@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""AMS 光谱传感器应用上位机。
-
-适配固件：2.3.0-ams-spectral-application / 协议 2.1
-上位机版本：3.0.0（中英文界面版）
-支持的传感器协议族：
-- AS7341 / AS7341L（0x39，手动 SMUX）
-- AS7343 / AS7343L（0x39，自动 SMUX）
-- TCS3448（0x59，AS7343 兼容寄存器协议）
-
-依赖：pyserial、matplotlib。Tkinter 随标准 Python 安装。
-"""
+"""AS7341、AS7343、TCS3448 光谱采集上位机。"""
 
 from __future__ import annotations
 
@@ -45,7 +35,7 @@ except ImportError as exc:  # pragma: no cover
 
 
 def _configure_matplotlib_chinese_font() -> str:
-    """选择系统中可用的中文字体，避免 Matplotlib 标题和坐标轴显示方框。"""
+    """选择可用的中文字体。"""
     candidates = (
         "Microsoft YaHei", "SimHei", "Noto Sans CJK SC",
         "Source Han Sans SC", "WenQuanYi Micro Hei",
@@ -125,7 +115,7 @@ class SensorIdentity:
 
 
 class SerialLink:
-    """按行收发串口数据，读线程只负责把完整报文送入界面队列。"""
+    """串口读写与接收队列。"""
 
     def __init__(self, event_queue: queue.Queue[tuple[str, Any]]) -> None:
         self.event_queue = event_queue
@@ -277,7 +267,7 @@ class AmsSpectralApp:
         self.crc_status_var = tk.StringVar(value="CRC：-")
 
     def _tr(self, chinese: str, english: str) -> str:
-        """返回当前界面语言对应的文字。协议字段本身不在这里翻译。"""
+        """返回当前界面语言的文字。"""
         return chinese if self.language_code == "zh" else english
 
     def _light_label(self, light: str) -> str:
@@ -304,7 +294,7 @@ class AmsSpectralApp:
         self.root.title(f"{name} v{APP_VERSION}  {author}: Hongchen Zhang")
 
     def _change_language(self, _event: object = None) -> None:
-        """重建界面文字和图表，串口对象与采样数据保持不变。"""
+        """切换界面语言并保留运行数据。"""
         target = "en" if self.language_var.get() == "English" else "zh"
         if target == self.language_code:
             return
@@ -487,8 +477,8 @@ class AmsSpectralApp:
         matrix_frame = ttk.LabelFrame(
             plot_frame,
             text=self._tr(
-                "图中实际数值（环境光为原始计数；各 LED 为亮场 − 暗场净值）",
-                "Values plotted (ambient is raw; each LED is light minus dark)"))
+                "逐通道数值（环境光 / LED 净值）",
+                "Per-channel values (ambient / LED net)"))
         matrix_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         self.value_matrix = ttk.Treeview(matrix_frame, show="headings", height=5)
         matrix_scroll = ttk.Scrollbar(matrix_frame, orient=tk.HORIZONTAL,
@@ -763,16 +753,10 @@ class AmsSpectralApp:
                    command=self.send_raw_command).pack(side=tk.RIGHT, padx=8)
 
         note = self._tr(
-            "自动识别以 I²C 地址、只读 ID 和寄存器签名确定协议族。"
-            "AS7341/AS7341L 共用 ID；AS7343/AS7343L 也共用地址和 ID，"
-            "所以无法仅靠数字通信证明精确料号。AS7343 与 AS7343L 的第三轮自动 SMUX "
-            "槽位顺序不同，可在“数据解释配置”中手动选择；该选择只改变通道解释，"
-            "不会把手动选择冒充为硬件识别结果。",
-            "Auto-detection uses the I²C address, read-only ID and register signatures to "
-            "identify the protocol family. AS7341/AS7341L share one ID, while AS7343/AS7343L "
-            "also share an address and ID, so digital communication alone cannot prove the "
-            "exact orderable part. The manual profile changes channel interpretation only; "
-            "it is never presented as new hardware-identification evidence.")
+            "型号识别依据 I²C 地址和身份寄存器。AS7341/AS7341L、"
+            "AS7343/AS7343L 无法仅靠 ID 区分；手动配置只改变通道映射。",
+            "Detection uses the I²C address and identity registers. AS7341/AS7341L and "
+            "AS7343/AS7343L share IDs; a manual profile changes the channel map only.")
         ttk.Label(self.test_tab, text=note, wraplength=1100).pack(fill=tk.X, padx=12, pady=6)
 
     def _build_log_tab(self) -> None:
@@ -1080,10 +1064,9 @@ class AmsSpectralApp:
             "profile": self.identity.profile,
             "effective_profile": self.identity.effective_profile,
             "profile_ambiguous": (
-                self._tr("自动默认/硬件仍有歧义", "AUTO default / hardware remains ambiguous")
+                self._tr("AUTO（料号未区分）", "AUTO (part not distinguished)")
                 if self.identity.profile_ambiguous == "1"
-                else self._tr("手动指定或地址可唯一确认",
-                              "Manual profile or unique address evidence")),
+                else self._tr("手动配置 / 唯一地址", "Manual profile / unique address")),
             "confidence": self.identity.confidence,
             "address": self.identity.address,
             "id_raw": self.identity.id_raw,
@@ -1114,24 +1097,18 @@ class AmsSpectralApp:
         if self.identity.profile_ambiguous == "1":
             candidates = self.identity.candidates.replace("_OR_", " / ")
             self.profile_note_var.set(self._tr(
-                f"数字通信只能确认 {candidates}；当前 AUTO 按 "
-                f"{self.identity.effective_profile} 解释原始 ADC 槽位。"
-                "购买标签或芯片丝印确认后，可手动选择对应配置。",
-                f"Digital communication only narrows the device to {candidates}. "
-                f"AUTO currently interprets the ADC slots as {self.identity.effective_profile}. "
-                "Select a profile manually after checking the package marking or purchase label."))
+                f"候选：{candidates}；当前通道配置：{self.identity.effective_profile}。",
+                f"Candidates: {candidates}; channel profile: {self.identity.effective_profile}."))
         elif "_OR_" in self.identity.candidates:
             self.profile_note_var.set(self._tr(
-                f"当前按 {self.identity.effective_profile} 手动解释数据；"
-                "这不是新的硬件 ID 证据，候选型号仍以“可能型号”为准。",
-                f"Data is manually interpreted as {self.identity.effective_profile}. "
-                "This is not new hardware-ID evidence; the candidate list remains authoritative."))
+                f"候选：{self.identity.candidates.replace('_OR_', ' / ')}；"
+                f"手动配置：{self.identity.effective_profile}。",
+                f"Candidates: {self.identity.candidates.replace('_OR_', ' / ')}; "
+                f"manual profile: {self.identity.effective_profile}."))
         elif self.identity.family == "TCS3448":
             self.profile_note_var.set(self._tr(
-                "0x59 地址与 0x81 ID 组合高度符合 TCS3448；"
-                "已按 TCS3448 官方中心波长解释通道。",
-                "The 0x59 address and 0x81 ID combination strongly matches TCS3448. "
-                "Channels use the official TCS3448 center wavelengths."))
+                "0x59 / ID 0x81；使用 TCS3448 通道表。",
+                "0x59 / ID 0x81; using the TCS3448 channel table."))
         else:
             self.profile_note_var.set(
                 self._tr("等待有效识别结果。", "Waiting for a valid identity result."))
@@ -1167,15 +1144,14 @@ class AmsSpectralApp:
                 f"Channel map changed to {len(names)} channels: {', '.join(names)}"))
 
     def _begin_measurement(self, sequence: int) -> None:
-        """开始一轮新测量时清除上一轮曲线，只保留本轮最新数据。"""
+        """开始新的四光源测量。"""
         self.current_measurement_sequence = sequence
         self.measurements.clear()
         self.ambient = [0] * len(self.channels)
         self._update_spectrum_table()
         self._redraw_spectrum_plot()
         self.last_frame_var.set(self._tr(
-            f"开始测量序号 {sequence}，已清除上一轮曲线",
-            f"Measurement {sequence} started; previous curves cleared"))
+            f"测量 {sequence} 开始", f"Measurement {sequence} started"))
 
     def _handle_ambient(self, tokens: list[str]) -> None:
         count = len(self.channels)
@@ -1184,7 +1160,7 @@ class AmsSpectralApp:
                 f"AMBIENT 数据不足，期望 {count} 个通道",
                 f"AMBIENT frame is short; expected {count} channels"))
         values = [self._parse_int(x) for x in tokens[8:8 + count]]
-        # 环境光采集是一幅独立的最新快照，不与之前的 LED 测量曲线叠加。
+        # 新环境光数据替换上一轮 LED 曲线。
         self.current_measurement_sequence = None
         self.measurements.clear()
         self.ambient = values
@@ -1216,7 +1192,7 @@ class AmsSpectralApp:
             light=[self._parse_int(x) for x in tokens[11:11 + count]],
             dark=[self._parse_int(x) for x in tokens[11 + count:11 + 2 * count]],
         )
-        # 固件正常会先发送 BEGIN；即使 BEGIN 丢失，也按 sequence 自动切换到最新批次。
+        # BEGIN 丢失时按 sequence 切换批次。
         if self.current_measurement_sequence != frame.sequence:
             self.current_measurement_sequence = frame.sequence
             self.measurements.clear()
@@ -1232,7 +1208,7 @@ class AmsSpectralApp:
         self._redraw_spectrum_plot()
 
     def _finish_measurement(self, sequence: int) -> None:
-        """保存一轮四光源的派生指标，用于重复性和漂移分析。"""
+        """记录一轮稳定性指标。"""
         if self.measurements:
             snapshot: dict[str, Any] = {"sequence": sequence, "time": time.time()}
             spectral_indices = [item[0] for item in self._spectral_channel_layout()]
@@ -1296,7 +1272,7 @@ class AmsSpectralApp:
         self._update_spectrum_table()
 
     def _rebuild_value_matrix(self) -> None:
-        """按“数据源为行、传感器通道为列”建立同屏实际值矩阵。"""
+        """重建逐通道数值表。"""
         columns = ("source",) + tuple(
             f"channel_{index}" for index in range(len(self.channels)))
         self.value_matrix.configure(columns=columns, displaycolumns=columns)
@@ -1361,12 +1337,12 @@ class AmsSpectralApp:
 
     @staticmethod
     def _channel_peak_nm(name: str) -> Optional[int]:
-        """从固件通道标签提取典型峰值；CLEAR/FD_RAW 返回 None。"""
+        """从通道名解析中心波长。"""
         match = re.search(r"_(\d+)$", name.upper())
         return int(match.group(1)) if match else None
 
     def _spectral_channel_layout(self) -> list[tuple[int, int, str]]:
-        """返回真正具有单一典型峰值的滤光通道。"""
+        """返回带中心波长的通道。"""
         result: list[tuple[int, int, str]] = []
         for index, name in enumerate(self.channels):
             peak_nm = self._channel_peak_nm(name)
@@ -1388,7 +1364,7 @@ class AmsSpectralApp:
             tick_stop = ((max(spectral_x) + 49) // 50) * 50
             wavelength_ticks = list(range(tick_start, tick_stop + 1, 50))
 
-        # 1. 仅将具有典型峰值的滤光通道绘制在真实 nm 横坐标上。
+        # 仅绘制有中心波长的通道。
         ambient_spectral = [self._safe_at(self.ambient, idx)
                             for idx in spectral_indices]
         if any(ambient_spectral):
@@ -1406,7 +1382,7 @@ class AmsSpectralApp:
         self.net_ax.set_title(self._tr("暗场扣除后净响应", "Dark-subtracted response"))
         self.net_ax.set_ylabel(self._tr("ADC 计数", "ADC counts"))
 
-        # 2. 每个光源归一化至自身峰值，用于比较谱形。
+        # 每路光源按自身峰值归一化。
         for light in LIGHTS:
             frame = self.measurements.get(light)
             if frame:
@@ -1422,7 +1398,7 @@ class AmsSpectralApp:
         self.normalized_ax.set_ylabel(self._tr("相对响应 (0–1)", "Relative response (0–1)"))
         self.normalized_ax.set_ylim(-0.03, 1.08)
 
-        # 3. 光源×通道热图，每行归一化以减少自动增益差异的影响。
+        # 热图逐行归一化。
         heat_rows: list[list[float]] = []
         heat_labels: list[str] = []
         for light in LIGHTS:
@@ -1438,13 +1414,13 @@ class AmsSpectralApp:
             self.heatmap_ax.set_yticklabels(heat_labels)
             self.heatmap_ax.set_title(
                 self._tr("光源–通道归一化热图", "Normalized source-channel heatmap"))
-            # 固定色标轴避免每次刷新累积 colorbar。
+            # 刷新时复用色标轴。
             image.set_clim(0.0, 1.0)
         else:
             self.heatmap_ax.set_title(
                 self._tr("光源–通道归一化热图", "Normalized source-channel heatmap"))
 
-        # 4. 信号质量：有效净信号占亮场读数的比例，不冒充统计 SNR。
+        # 净信号占亮场比例（非统计 SNR）。
         quality_labels: list[str] = []
         quality_values: list[float] = []
         quality_colors: list[str] = []

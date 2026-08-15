@@ -3,7 +3,7 @@
 
 #include "stm32g0xx_hal.h"
 
-/* 应用层负责串口协议、四路光源时序、测温和光谱驱动调度。 */
+/* 串口协议、光源时序、测温和传感器调度。 */
 
 #ifdef __cplusplus
 extern "C" {

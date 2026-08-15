@@ -13,10 +13,7 @@ extern "C" {
 #define AS734X_MAX_CHANNELS           14U
 #define AS734X_GAIN_COUNT             13U
 
-/*
- * 仅靠 I²C 地址和器件 ID 无法区分所有光学版本。
- * 驱动先确认寄存器协议族，再把共用同一数字接口的候选型号一并上报。
- */
+/* 地址和数字 ID 只能确定协议族，不能区分全部光学版本。 */
 typedef enum
 {
     AS734X_MODEL_NONE = 0,
@@ -34,10 +31,7 @@ typedef enum
     AS734X_PROTOCOL_RAW_I2C
 } AS734X_Protocol_t;
 
-/*
- * 同系列器件可能共用地址、ID 和寄存器表，profile 只决定原始 ADC 槽位如何解释。
- * AUTO 不改变硬件识别结果，并以普通 AS7341 或 AS7343 的通道顺序作为默认值。
- */
+/* profile 只控制 ADC 槽位映射；AUTO 使用 AS7341/AS7343 标准映射。 */
 typedef enum
 {
     AS734X_PROFILE_AUTO = 0,

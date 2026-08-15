@@ -9,7 +9,7 @@
 - Device output: UTF-8-compatible ASCII payload wrapped as `$<payload>*<CRC16>\r\n`.
 - CRC: CRC-16/CCITT-FALSE over payload bytes only; polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR. The hexadecimal field is four uppercase digits.
 
-Example payload `PONG,1234` is transmitted with a CRC calculated over exactly the nine bytes `PONG,1234`.
+The CRC for `PONG,1234` covers those nine bytes only.
 
 ## Startup sequence
 
@@ -24,7 +24,7 @@ After reset the device emits:
 
 ### `INFO`
 
-Key/value frame containing firmware version, protocol version, MCU, sensor status, family, candidates, register protocol, requested/effective profile, ambiguity, confidence, I²C address, IDs, gain, timing, channel count, and last diagnostic state.
+Key/value frame containing versions, MCU, sensor identity, I²C address, acquisition settings, channel count, and diagnostic state.
 
 ### `SENSOR`
 
@@ -36,7 +36,7 @@ Detailed identity result, including `SIG92`, `SIG5A`, `SIGCFG0`, and `SIGD6`. A 
 CHANNELS,<name0>,<name1>,...,<nameN-1>
 ```
 
-This frame defines the exact channel order for subsequent `AMBIENT` and `MEAS` frames. The host must rebuild its table when this list changes.
+Defines the channel order for subsequent `AMBIENT` and `MEAS` frames.
 
 ## Measurement frames
 
@@ -109,9 +109,8 @@ Flag bits:
 | `AS FORCEINIT` | Reconfigure the detected sensor |
 | `AS RESET` | Sensor reset followed by configuration |
 
-Integer arguments accept decimal or a `0x` prefix where the command parser uses numeric conversion.
+Integer arguments accept decimal and `0x` hexadecimal notation.
 
-## Compatibility rule
+## Receiver compatibility
 
-Protocol `2.1` consumers should ignore unknown key/value fields and use `CHANNELS` plus `CHANNEL_COUNT` instead of assuming a fixed sensor. An incompatible change to field order in `AMBIENT`/`MEAS`, CRC framing, or channel semantics requires a protocol-version change.
-
+Receivers ignore unknown key/value fields and use `CHANNELS` plus `CHANNEL_COUNT` as the active channel definition.

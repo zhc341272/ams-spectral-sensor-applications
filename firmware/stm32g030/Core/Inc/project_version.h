@@ -1,7 +1,6 @@
 #ifndef PROJECT_VERSION_H
 #define PROJECT_VERSION_H
 
-/* 版本记录见仓库根目录 CHANGELOG.md。 */
 #define PROJECT_FW_VERSION_MAJOR       2U
 #define PROJECT_FW_VERSION_MINOR       3U
 #define PROJECT_FW_VERSION_PATCH       0U

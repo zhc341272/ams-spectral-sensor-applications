@@ -10,10 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * 本文件是主板应用层：接收串口命令，安排光源和暗场采样，并把结果按协议 2.1
- * 发给上位机。传感器型号差异留在 as734x.c 内处理，这里的测量流程对三种器件一致。
- */
+/* 主板应用层：串口命令、光源/暗场时序和协议输出。 */
 
 #define FW_VERSION                  PROJECT_FW_VERSION_STRING
 #define PROTOCOL_VERSION            PROJECT_PROTOCOL_VERSION
@@ -239,7 +236,7 @@ static HAL_StatusTypeDef ReadAdcAverage(uint16_t *raw)
     uint8_t index;
 
     if (raw == NULL) return HAL_ERROR;
-    /* NTC 变化很慢，多次平均可压低 ADC 抖动，不影响光谱测量节拍。 */
+    /* NTC ADC 取多次平均。 */
     for (index = 0U; index < BOARD_ADC_AVERAGE_SAMPLES; ++index)
     {
         if (HAL_ADC_Start(&BOARD_NTC_ADC_HANDLE) != HAL_OK) return HAL_ERROR;
@@ -415,7 +412,7 @@ static void SendChannels(void)
 
 static void SendDetection(void)
 {
-    /* 候选型号与实际解析配置分开发送，避免把手动 profile 当成硬件证据。 */
+    /* CANDIDATES 是识别结果，PROFILE 是通道映射。 */
     ProtocolSendPayload("SENSOR,STATUS=%s,FAMILY=%s,CANDIDATES=%s,"
                         "PROTOCOL=%s,PROFILE=%s,EFFECTIVE_PROFILE=%s,"
                         "PROFILE_AMBIGUOUS=%u,CONFIDENCE=%s,ADDR=%02X,"
@@ -597,7 +594,7 @@ static AS734X_Status_t SelectGainForSource(LightSource_t source,
         return status;
     }
 
-    /* 每种光源保存自己的增益；预采样最多调整四次，防止来回震荡拖慢整轮测量。 */
+    /* 每路光源独立保存增益，预采样最多调整四次。 */
     SetLight(source);
     HAL_Delay(BOARD_LED_SETTLE_MS);
     for (iteration = 0U; iteration < MAX_AUTO_GAIN_ITERATIONS; ++iteration)
@@ -653,7 +650,7 @@ static AS734X_Status_t MeasureSource(LightSource_t source,
     status = AS734X_ReadOne(&g_sensor, &record->dark);
     if (status != AS734X_OK) return status;
 
-    /* 光源稳定延时与暗场稳定延时在 board_config.h 中统一配置。 */
+    /* 稳定延时定义在 board_config.h。 */
     SetLight(source);
     HAL_Delay(BOARD_LED_SETTLE_MS);
     status = AS734X_ReadOne(&g_sensor, &record->light);
@@ -689,7 +686,7 @@ static void SendMeasurement(const MeasurementRecord_t *record)
                       (unsigned int)record->dark.flags);
     if ((length < 0) || ((size_t)length >= sizeof(payload))) return;
 
-    /* 报文先放全部亮场，再放全部暗场；上位机按 CHANNELS 元数据解释顺序。 */
+    /* MEAS 中先写亮场数组，再写暗场数组。 */
     for (channel = 0U; channel < count; ++channel)
     {
         int written = snprintf(&payload[length],
@@ -724,7 +721,7 @@ static void RunFullMeasurement(void)
         return;
     }
 
-    /* 四路光源逐一完成“选增益－暗场－亮场”，任一路失败都立即关灯并终止本轮。 */
+    /* 每路依次完成选增益、暗场和亮场；失败时关灯并终止。 */
     ++g_sequence;
     ProtocolSendPayload("BEGIN,%lu", (unsigned long)g_sequence);
     for (source = LIGHT_405; source < LIGHT_COUNT; ++source)
@@ -1283,7 +1280,7 @@ static void ProcessCommand(char *command_line)
     char *context = command_line;
     char *command = NextToken(&context);
 
-    /* 命令名不区分大小写，参数边界在各子命令中再次检查。 */
+    /* 命令名不区分大小写。 */
     if (command == NULL) return;
     ToUpperAscii(command);
 
@@ -1363,7 +1360,7 @@ void SpectralApp_UartRxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart != &BOARD_CONSOLE_UART_HANDLE) return;
 
-    /* 中断中只拼接一行命令；解析和回包都放到主循环，避免阻塞串口中断。 */
+    /* 中断只接收命令行，解析和回包在主循环完成。 */
     if ((g_uart_rx_byte == '\r') || (g_uart_rx_byte == '\n'))
     {
         if ((g_uart_build_length > 0U) && (g_uart_command_ready == 0U))
@@ -1445,7 +1442,7 @@ void SpectralApp_Process(void)
         HAL_GPIO_TogglePin(BOARD_STATUS_LED_PORT, BOARD_STATUS_LED_PIN);
     }
 
-    /* 复制命令时短暂关中断，避免接收中断改写正在解析的缓冲区。 */
+    /* 复制命令时锁住接收缓冲区。 */
     if (g_uart_command_ready != 0U)
     {
         char local_command[BOARD_UART_COMMAND_MAX];
