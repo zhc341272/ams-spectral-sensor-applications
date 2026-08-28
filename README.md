@@ -12,9 +12,11 @@ STM32 firmware and a Python desktop application for **AS7341, AS7343, and TCS344
 - Uses two manual-SMUX passes for AS7341 and three automatic-SMUX cycles for AS7343/TCS3448.
 - Measures 405 nm, white, 850 nm, and 940 nm sources with a separate dark frame for each source.
 - Keeps independent automatic gain, lit/dark/net values, saturation flags, integration settings, and board temperature for each source.
-- Chinese UI by default with an English option.
-- Displays spectra, heatmaps, stability, temperature, and a source-by-channel value table.
-- Uses CRC-protected serial frames and exports measurement or stability data to CSV.
+- Experiment metadata for experiment name, sample ID, operator, and notes.
+- 1/3/5/10-scan averaging with gain and integration-time scaling before averaging.
+- Reference spectra, relative response, absorbance, live spectra, a full-channel heatmap, actual values, and spectral metrics.
+- Saved experiment records with sample overlays, CSV export for current/batch/stability data, and PNG plot export.
+- CRC-protected serial frames and a Chinese-default interface with an English option.
 
 ## Quick start
 
@@ -22,7 +24,7 @@ STM32 firmware and a Python desktop application for **AS7341, AS7343, and TCS344
 2. Open `host-software` and run `install_dependencies.bat`.
 3. Connect the board over USB and run `run.bat`.
 4. Select the COM port and click **Connect**.
-5. Click **Measure all four LEDs**.
+5. Enter the sample information, select an averaging count, and click **Acquire and save record**.
 
 See [Firmware build and flash](docs/FIRMWARE_BUILD.md) and the [Desktop application guide](docs/USER_GUIDE.md) for details.
 
@@ -36,15 +38,15 @@ See [Firmware build and flash](docs/FIRMWARE_BUILD.md) and the [Desktop applicat
 
 AS7341L and AS7343L remain available as manual channel profiles. See [Sensor identification and channels](docs/SENSOR_SUPPORT.md) for detection rules and channel order.
 
-## Displayed data
+## Experiment features
 
-- Dark-subtracted spectral response
-- Per-source peak-normalized spectra
-- Source-channel heatmap
-- Net-to-lit signal ratio
-- Repeated-measurement stability
-- NTC temperature history
-- Per-channel values for ambient and all four LEDs
+- Four-source dark-subtracted counts, relative response, and absorbance
+- Reference management with acquisition-condition consistency checks
+- Peak, integral, and centroid analysis over an adjustable wavelength range
+- Actual values for every channel and a source-channel heatmap
+- Sample record table, multi-record overlays, and long-table batch export
+- Repeated-measurement stability normalized by gain and integration time
+- NTC temperature history, LED control, and low-level diagnostics
 
 ![English desktop application](docs/images/ui-en.png)
 
@@ -70,5 +72,4 @@ VERSION.txt               Version information
 
 - Firmware: `2.3.0-ams-spectral-application`
 - Serial protocol: `2.1`
-- Desktop application: `3.0.0`
-
+- Desktop application: `4.0.0`

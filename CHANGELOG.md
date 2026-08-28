@@ -1,5 +1,25 @@
 # 修改记录 / Changelog
 
+## 上位机 4.0.0 - 2026-08-29
+
+- 主界面改为实验采集工作区，光谱图作为主体，设备控制和诊断移到独立页面。
+- 实验记录增加实验名称、样品编号、操作人员和备注。
+- 增加 1、3、5、10 次重复采集平均；不同增益和积分时间的数据会先折算到同一曝光条件。
+- 增加参考谱、相对响应和吸光度显示。采集条件改变时自动清除参考谱。
+- 增加可调波长区间的峰值、积分、质心和状态分析。
+- 增加实验记录表、样品叠加比较、批量 CSV 和图表 PNG 导出。
+- 稳定性曲线改为同时按增益和积分时间归一化。
+
+### English
+
+- Reworked the main window around an experiment workflow with the spectrum plot as the primary view.
+- Added experiment name, sample ID, operator, and notes to saved records.
+- Added 1/3/5/10-scan averaging with exposure scaling before averaging.
+- Added reference spectra, relative response, and absorbance. References are cleared when acquisition settings change.
+- Added adjustable-range peak, integral, centroid, and status analysis.
+- Added a record table, sample overlays, batch CSV export, and PNG plot export.
+- Normalized stability data by both gain and integration time.
+
 ## 固件 2.3.0 / 上位机 3.0.0 - 2026-08-16
 
 - 项目更名为“AMS 光谱传感器应用 / AMS Spectral Sensor Applications”。

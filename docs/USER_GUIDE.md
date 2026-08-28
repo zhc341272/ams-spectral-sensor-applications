@@ -2,9 +2,9 @@
 
 [中文](USER_GUIDE.zh-CN.md) · [Back to README](../README.md)
 
-## 1. Install
+## Install and start
 
-Python 3.10 or newer is required. The Windows installation must include Tcl/Tk.
+Python 3.10 or newer is required. On Windows, install Python with Tcl/Tk.
 
 ```powershell
 cd host-software
@@ -14,82 +14,90 @@ python -m pip install -r requirements.txt
 python ams_spectral_sensor_app.py
 ```
 
-You may instead double-click `install_dependencies.bat` and then `run.bat`.
+On Windows, `install_dependencies.bat` installs the dependencies and `run.bat` starts the application.
 
-## 2. Connect and identify the sensor
+## Connect the board
 
-1. Connect the board USB cable and power-cycle the board after changing a sensor.
-2. Start the application. Chinese is selected by default; choose **English** at the upper right if needed.
-3. Select the board COM port and keep `115200` baud.
-4. Click **Connect**. The application sends `PING`, `DETECT`, `TEMP`, and `LED STATUS` automatically.
-5. Check the device summary:
-   - AS7341 normally reports address `0x39`, 10 channels.
-   - AS7343 normally reports address `0x39`, 14 channels.
-   - TCS3448 normally reports address `0x59`, 14 channels.
+1. Connect the board by USB. Power-cycle it after replacing a sensor.
+2. Select the board COM port and keep the baud rate at `115200`.
+3. Click **Connect**. The application queries the sensor, temperature, and LED status.
+4. Check the detected model, I²C address, channel count, and firmware version in the device summary.
 
-`Candidates` comes from the identity registers. `Data profile` selects the channel map; changing it does not change the detection result.
+Typical results are `0x39 / 10 channels` for AS7341, `0x39 / 14 channels` for AS7343, and `0x59 / 14 channels` for TCS3448. Identity registers alone cannot distinguish AS7341 from AS7341L or AS7343 from AS7343L. Select an L profile only when the package marking or purchasing record confirms it.
 
-## 3. Take a measurement
+## Run an experiment
 
-### Read ambient
+### 1. Enter sample information
 
-**Read ambient** turns all LEDs off, waits 50 ms, and captures a snapshot. It replaces the current four-source curves.
+The experiment name, sample ID, operator, and notes are stored with experiment records and CSV exports. The sample ID is also used in the suggested file name.
 
-### Measure all four LEDs
+### 2. Choose scan averaging
 
-**Measure all four LEDs** processes 405 nm, white, 850 nm, and 940 nm in order. For each source the firmware:
+Select 1, 3, 5, or 10 scans, then click **Acquire and save record**. The application runs complete four-source measurements and saves the averaged result as one experiment record.
 
-1. runs a short per-source automatic-gain probe when enabled;
-2. turns all sources off and waits 50 ms;
-3. acquires the dark frame;
-4. turns on one source and waits 50 ms;
-5. acquires the lit frame;
-6. turns the source off and reports lit, dark, and status values.
+Automatic gain may choose different gain or integration settings between scans. Before averaging, every scan is scaled to the exposure conditions of the final scan. ADC counts from different ranges are therefore not averaged directly.
 
-The value table shows ambient raw counts and `lit − dark` LED counts for every channel. A dash means no sample has been received.
+### 3. Inspect the result
 
-### Continuous acquisition
+**Live spectra** is the primary plot. Only filtered channels with nominal center wavelengths are plotted. `CLEAR` and `FD_RAW` remain available in the heatmap and value table because they do not have one center wavelength.
 
-Set a period and click **Start streaming**. The minimum is 1000 ms; a new sequence starts after the current one finishes.
+**Values & analysis** shows the value of every channel under every source and reports:
 
-## 4. Read the plots
+- peak value and wavelength within the selected range;
+- trapezoidal integral;
+- positive-response-weighted centroid wavelength;
+- lit/dark status flags.
 
-- **Dark-subtracted response:** spectral filter channels plotted at their nominal peak wavelengths. `CLEAR` and `FD_RAW` are omitted because they do not have one center wavelength.
-- **Peak-normalized spectral shape:** each source is divided by its own peak for shape comparison.
-- **Normalized source-channel heatmap:** includes every reported channel. Each row is normalized independently.
-- **Usable net signal fraction:** `sum(net) / sum(lit)` across wavelength channels; this is not statistical SNR.
-- **Stability over time:** summed net wavelength channels divided by gain, recorded after complete sequences.
-- **Temperature history:** board NTC readings versus elapsed time.
+The default analysis range is 400–900 nm and can be edited.
 
-Red indicates saturation in the lit or dark sample. Reduce illumination, integration time, or gain and measure again.
+### 4. Export
 
-## 5. Configure acquisition
+**Export current CSV** writes experiment metadata, device identity, lit, dark, net, processed values, gain, integration time, temperature, and flags. **Save plot PNG** exports the primary graph.
 
-- **Automatic gain:** keeps an independent remembered gain for every LED source.
-- **Fixed gain:** used when automatic gain is disabled. AS7341 supports gain indices through 512×; AS7343/TCS3448 also expose 1024× and 2048×.
-- **ATIME / ASTEP:** determine integration time. The application displays the actual microseconds reported by firmware.
-- **Data profile:** use `AUTO` by default; select an `L` profile from package markings or purchasing records.
+CSV files use UTF-8 with BOM for direct use in Excel.
 
-## 6. LED and temperature page
+## Reference, relative response, and absorbance
 
-Each LED can be switched independently. **Cycle test** turns on each source for 500 ms and then turns all sources off. Manual LED control does not capture a paired dark frame.
+The firmware already captures a paired dark frame for every source. For a relative measurement:
 
-The NTC panel shows ADC counts, millivolts, calculated resistance, and temperature. Continuous monitoring is independent of spectral streaming.
+1. insert the reference or blank sample;
+2. complete one acquisition;
+3. click **Set current as reference**;
+4. insert the test sample and acquire again;
+5. select **Relative response (%)** or **Absorbance**.
 
-## 7. Configuration and tests
+Gain and integration time are normalized before the calculation:
 
-The details panel exposes raw identity and signature registers. Quick tests cover board status, sensor configuration, register read/write restoration, reinitialization, reset, forced sample, and full diagnostics.
+```text
+relative response = 100 × sample net response / reference net response
+absorbance        = -log10(sample net response / reference net response)
+net response      = lit - dark
+```
 
-Record the original value before a register write. Use **Force reinitialization** or power-cycle the board after testing.
+The reference is cleared when the sensor profile, channel map, gain, auto-gain, or integration setting changes. This prevents processing measurements acquired under inconsistent conditions. A reference channel of zero produces a dash instead of an invalid value.
 
-## 8. Export data
+## Live acquisition
 
-- **Export current CSV:** sensor identity followed by ambient, lit, dark, and net values per channel for all four sources.
-- **Export stability CSV:** one row per source per completed sequence, including gain, flags, temperature, sum, 1×-gain normalized sum, and peak.
-- **Save log:** stores timestamped transmitted and received protocol payloads.
+Set an interval and click **Start streaming** to continuously update the primary plot and stability series. Live mode does not create experiment records automatically. Use **Save current measurement** on the Records page to retain a useful snapshot.
 
-CSV files use UTF-8 with BOM.
+The firmware starts a new sequence only after the previous one has completed, so a short interval does not interrupt a measurement.
 
-## 9. Language switching
+## Records and comparison
 
-Choose `中文` or `English` at the upper right. The serial connection, measurements, settings, and log are retained.
+Each **Acquire and save record** result appears in the record table. Select multiple records and choose the 405, white, 850, or 940 nm source to overlay them. When nothing is selected, the latest eight records are shown.
+
+**Export records CSV** uses a long-table layout: each row represents one record, one source, and one sensor channel. It is suitable for Python, R, Origin, and statistical tools. Selected records are exported; when nothing is selected, all records are exported.
+
+## Stability
+
+Every complete measurement is appended to the stability series. The vertical axis is the summed net wavelength-channel signal normalized by actual gain and integration time to counts per second. Use it to check source warm-up, drift, and repeatability. The series can be exported separately.
+
+## Device control and diagnostics
+
+The Device page provides individual LED control, the cycle test, and NTC temperature monitoring. The Diagnostics page contains identity details, acquisition settings, register access, and firmware test commands.
+
+Register writes are intended for debugging. Record the original value and run **Force reinitialization** or power-cycle the board afterward.
+
+## Language
+
+Choose `中文` or `English` at the upper right. The serial connection, current measurement, reference, experiment records, settings, and log are preserved.

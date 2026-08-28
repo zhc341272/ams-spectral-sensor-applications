@@ -2,8 +2,8 @@ AMS 光谱传感器应用 / AMS Spectral Sensor Applications
 
 固件 / Firmware: 2.3.0-ams-spectral-application
 串口协议 / Serial protocol: 2.1
-上位机 / Desktop application: 3.0.0
-日期 / Date: 2026-08-16
+上位机 / Desktop application: 4.0.0
+日期 / Date: 2026-08-29
 
 支持 / Supported:
 - AS7341: 0x39, 10 channels
