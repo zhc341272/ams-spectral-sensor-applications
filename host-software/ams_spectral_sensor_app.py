@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import queue
 import re
 import threading
@@ -27,7 +28,7 @@ except ImportError as exc:  # pragma: no cover
 
 try:
     from matplotlib import font_manager, rcParams
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     from matplotlib.figure import Figure
 except ImportError as exc:  # pragma: no cover
     raise SystemExit(
@@ -49,7 +50,7 @@ def _configure_matplotlib_chinese_font() -> str:
 
 
 MATPLOTLIB_FONT = _configure_matplotlib_chinese_font()
-APP_VERSION = "3.0.0"
+APP_VERSION = "4.0.0"
 APP_NAME_ZH = "AMS 光谱传感器应用"
 APP_NAME_EN = "AMS Spectral Sensor Applications"
 DEFAULT_BAUD = 115200
@@ -112,6 +113,23 @@ class SensorIdentity:
         return (self.status, self.family, self.candidates, self.protocol,
                 self.profile, self.effective_profile, self.address,
                 self.id_raw, self.id_code)
+
+
+@dataclass
+class ExperimentRecord:
+    """一次写入实验记录表的完整四光源测量。"""
+
+    record_id: int
+    timestamp: datetime
+    experiment_name: str
+    sample_id: str
+    operator: str
+    notes: str
+    sensor_family: str
+    effective_profile: str
+    channels: list[str]
+    frames: dict[str, SpectrumFrame]
+    average_count: int = 1
 
 
 class SerialLink:
@@ -198,6 +216,14 @@ class AmsSpectralApp:
         self.channels = list(DEFAULT_CHANNELS)
         self.ambient = [0] * len(self.channels)
         self.measurements: dict[str, SpectrumFrame] = {}
+        self.reference_measurements: dict[str, SpectrumFrame] = {}
+        self.reference_signature: Optional[tuple[str, str, tuple[str, ...]]] = None
+        self.experiment_records: list[ExperimentRecord] = []
+        self.next_record_id = 1
+        self.capture_active = False
+        self.capture_target = 1
+        self.capture_buffer: list[dict[str, SpectrumFrame]] = []
+        self.last_average_count = 1
         self.temperature_history: deque[tuple[float, float]] = deque(maxlen=600)
         self.measurement_history: deque[dict[str, Any]] = deque(maxlen=200)
         self.current_measurement_sequence: Optional[int] = None
@@ -211,7 +237,9 @@ class AmsSpectralApp:
         self._build_ui()
         self.refresh_ports()
         self._rebuild_spectrum_table()
+        self._rebuild_records_tree()
         self._redraw_spectrum_plot()
+        self._redraw_comparison_plot()
         self._redraw_stability_plot()
         self._redraw_temperature_plot()
 
@@ -266,6 +294,19 @@ class AmsSpectralApp:
         self.last_frame_var = tk.StringVar(value="尚未采样")
         self.crc_status_var = tk.StringVar(value="CRC：-")
 
+        self.experiment_name_var = tk.StringVar(value="光谱采集实验")
+        self.sample_id_var = tk.StringVar()
+        self.operator_var = tk.StringVar()
+        self.notes_var = tk.StringVar()
+        self.average_count_var = tk.StringVar(value="1")
+        self.display_mode_var = tk.StringVar(value="暗场扣除净值")
+        self.reference_status_var = tk.StringVar(value="未设置参考谱")
+        self.capture_status_var = tk.StringVar(value="就绪")
+        self.comparison_source_var = tk.StringVar(value="WHITE")
+        self.roi_start_var = tk.StringVar(value="400")
+        self.roi_end_var = tk.StringVar(value="900")
+        self.cursor_var = tk.StringVar(value="")
+
     def _tr(self, chinese: str, english: str) -> str:
         """返回当前界面语言的文字。"""
         return chinese if self.language_code == "zh" else english
@@ -288,6 +329,26 @@ class AmsSpectralApp:
         chinese, english = labels.get(status.upper(), (status, status))
         return self._tr(chinese, english)
 
+    def _display_mode_labels(self) -> tuple[str, str, str]:
+        return (
+            self._tr("暗场扣除净值", "Dark-subtracted counts"),
+            self._tr("相对响应 (%)", "Relative response (%)"),
+            self._tr("吸光度", "Absorbance"),
+        )
+
+    def _display_mode_code(self) -> str:
+        value = self.display_mode_var.get()
+        if value in ("相对响应 (%)", "Relative response (%)"):
+            return "RELATIVE"
+        if value in ("吸光度", "Absorbance"):
+            return "ABSORBANCE"
+        return "NET"
+
+    def _set_display_mode_code(self, code: str) -> None:
+        labels = self._display_mode_labels()
+        index = {"NET": 0, "RELATIVE": 1, "ABSORBANCE": 2}.get(code, 0)
+        self.display_mode_var.set(labels[index])
+
     def _set_window_title(self) -> None:
         name = APP_NAME_ZH if self.language_code == "zh" else APP_NAME_EN
         author = self._tr("作者", "Author")
@@ -299,20 +360,24 @@ class AmsSpectralApp:
         if target == self.language_code:
             return
 
+        display_mode = self._display_mode_code()
         old_log = ""
         if hasattr(self, "log_text"):
             old_log = self.log_text.get("1.0", tk.END)
         self.language_code = target
+        self._set_display_mode_code(display_mode)
         for child in self.root.winfo_children():
             child.destroy()
         self._build_ui()
         self.refresh_ports()
         self._rebuild_spectrum_table()
+        self._rebuild_records_tree()
         self._update_identity_display()
         self._update_profile_options()
         self._update_gain_options()
         self._refresh_runtime_labels()
         self._redraw_spectrum_plot()
+        self._redraw_comparison_plot()
         self._redraw_stability_plot()
         self._redraw_temperature_plot()
         if old_log.strip():
@@ -332,6 +397,8 @@ class AmsSpectralApp:
         self.stream_button.configure(
             text=self._tr("停止连续读取", "Stop streaming") if self.stream_active
             else self._tr("开始连续读取", "Start streaming"))
+        self.capture_button.configure(
+            state=tk.DISABLED if self.capture_active else tk.NORMAL)
         self.crc_status_var.set(
             self._tr("CRC：正常", "CRC: OK") if self.crc_state is True
             else self._tr("CRC：错误", "CRC: error") if self.crc_state is False
@@ -351,6 +418,17 @@ class AmsSpectralApp:
             self.last_frame_var.set(self._tr("环境光数据已读取", "Ambient data received"))
         else:
             self.last_frame_var.set(self._tr("尚未采样", "Not sampled yet"))
+        if self.capture_active:
+            self.capture_status_var.set(self._tr(
+                f"正在采集 {len(self.capture_buffer) + 1}/{self.capture_target}",
+                f"Acquiring {len(self.capture_buffer) + 1}/{self.capture_target}"))
+        elif self.experiment_records:
+            self.capture_status_var.set(self._tr(
+                f"已保存 {len(self.experiment_records)} 条实验记录",
+                f"{len(self.experiment_records)} experiment records saved"))
+        else:
+            self.capture_status_var.set(self._tr("就绪", "Ready"))
+        self._update_reference_status()
 
     def _build_ui(self) -> None:
         self._set_window_title()
@@ -359,15 +437,21 @@ class AmsSpectralApp:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
 
         self.data_tab = ttk.Frame(self.notebook)
+        self.records_tab = ttk.Frame(self.notebook)
+        self.stability_tab = ttk.Frame(self.notebook)
         self.io_tab = ttk.Frame(self.notebook)
         self.test_tab = ttk.Frame(self.notebook)
         self.log_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.data_tab, text=self._tr("测量与图表", "Measurements & charts"))
-        self.notebook.add(self.io_tab, text=self._tr("LED 与温度", "LED & temperature"))
-        self.notebook.add(self.test_tab, text=self._tr("配置与测试", "Configuration & tests"))
+        self.notebook.add(self.data_tab, text=self._tr("实验采集", "Experiment"))
+        self.notebook.add(self.records_tab, text=self._tr("记录与对比", "Records & comparison"))
+        self.notebook.add(self.stability_tab, text=self._tr("时间稳定性", "Stability"))
+        self.notebook.add(self.io_tab, text=self._tr("设备控制", "Device control"))
+        self.notebook.add(self.test_tab, text=self._tr("诊断与配置", "Diagnostics & setup"))
         self.notebook.add(self.log_tab, text=self._tr("通信日志", "Communication log"))
 
         self._build_data_tab()
+        self._build_records_tab()
+        self._build_stability_tab()
         self._build_io_tab()
         self._build_test_tab()
         self._build_log_tab()
@@ -408,13 +492,16 @@ class AmsSpectralApp:
         center = ttk.Panedwindow(self.data_tab, orient=tk.HORIZONTAL)
         center.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        sidebar = ttk.Frame(center, width=330)
+        sidebar = ttk.Frame(center, width=340)
         plot_frame = ttk.Frame(center)
         center.add(sidebar, weight=0)
         center.add(plot_frame, weight=1)
-        self.root.after_idle(lambda: center.sashpos(0, 330))
+        self.root.after_idle(
+            lambda: center.sashpos(0, 340) if center.winfo_exists() else None)
 
+        self._build_experiment_panel(sidebar)
         self._build_acquisition_panel(sidebar)
+        self._build_processing_panel(sidebar)
         self._build_identity_panel(sidebar)
 
         toolbar = ttk.Frame(plot_frame)
@@ -423,71 +510,182 @@ class AmsSpectralApp:
             side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(toolbar, text=self._tr("导出当前数据 CSV", "Export current CSV"),
                    command=self.export_current_csv).pack(side=tk.RIGHT)
-        ttk.Button(toolbar, text=self._tr("导出稳定性 CSV", "Export stability CSV"),
-                   command=self.export_stability_csv).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(toolbar, text=self._tr("保存图像 PNG", "Save plot PNG"),
+                   command=self.export_current_plot).pack(side=tk.RIGHT, padx=4)
 
         self.analysis_notebook = ttk.Notebook(plot_frame)
 
         overview = ttk.Frame(self.analysis_notebook)
-        stability = ttk.Frame(self.analysis_notebook)
+        heatmap_frame = ttk.Frame(self.analysis_notebook)
         table_frame = ttk.Frame(self.analysis_notebook)
         self.analysis_notebook.add(
-            overview, text=self._tr("当前批次光谱", "Current spectra"))
+            overview, text=self._tr("实时光谱", "Live spectra"))
         self.analysis_notebook.add(
-            stability, text=self._tr("时间稳定性", "Stability over time"))
+            heatmap_frame, text=self._tr("通道热图", "Channel heatmap"))
         self.analysis_notebook.add(
-            table_frame, text=self._tr("全部通道数据", "All channel data"))
+            table_frame, text=self._tr("数值与分析", "Values & analysis"))
 
-        self.spectrum_figure = Figure(figsize=(11.2, 7.4), dpi=100)
-        self.net_ax = self.spectrum_figure.add_subplot(221)
-        self.normalized_ax = self.spectrum_figure.add_subplot(222)
-        self.heatmap_ax = self.spectrum_figure.add_subplot(223)
-        self.quality_ax = self.spectrum_figure.add_subplot(224)
+        self.spectrum_figure = Figure(figsize=(11.2, 6.8), dpi=100)
+        self.spectrum_ax = self.spectrum_figure.add_subplot(111)
         self.spectrum_canvas = FigureCanvasTkAgg(self.spectrum_figure, master=overview)
         self.spectrum_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.spectrum_canvas, overview, pack_toolbar=True)
+        self.spectrum_canvas.mpl_connect("motion_notify_event", self._on_spectrum_motion)
+        ttk.Label(overview, textvariable=self.cursor_var).pack(fill=tk.X, padx=6, pady=2)
 
-        self.stability_figure = Figure(figsize=(11.2, 7.0), dpi=100)
-        self.stability_ax = self.stability_figure.add_subplot(111)
-        self.stability_canvas = FigureCanvasTkAgg(self.stability_figure, master=stability)
-        self.stability_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-        columns = ("channel", "ambient", "dark", "405", "white", "850", "940")
-        self.spectrum_tree = ttk.Treeview(table_frame, columns=columns,
-                                          show="headings")
-        headings = {
-            "channel": self._tr("通道", "Channel"),
-            "ambient": self._tr("环境光", "Ambient"),
-            "dark": self._tr("暗场", "Dark"),
-            "405": self._tr("405净值", "405 net"),
-            "white": self._tr("白光净值", "White net"),
-            "850": self._tr("850净值", "850 net"),
-            "940": self._tr("940净值", "940 net"),
-        }
-        for col in columns:
-            self.spectrum_tree.heading(col, text=headings[col])
-            self.spectrum_tree.column(col, width=120 if col != "channel" else 150,
-                                      minwidth=80, anchor=tk.CENTER, stretch=True)
-        y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL,
-                                 command=self.spectrum_tree.yview)
-        self.spectrum_tree.configure(yscrollcommand=y_scroll.set)
-        self.spectrum_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
-                                padx=(6, 0), pady=6)
-        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.heatmap_figure = Figure(figsize=(11.2, 6.8), dpi=100)
+        self.heatmap_ax = self.heatmap_figure.add_subplot(111)
+        self.heatmap_canvas = FigureCanvasTkAgg(self.heatmap_figure, master=heatmap_frame)
+        self.heatmap_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.heatmap_canvas, heatmap_frame, pack_toolbar=True)
 
         matrix_frame = ttk.LabelFrame(
-            plot_frame,
+            table_frame,
             text=self._tr(
-                "逐通道数值（环境光 / LED 净值）",
-                "Per-channel values (ambient / LED net)"))
-        matrix_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+                "逐通道数值",
+                "Per-channel values"))
+        matrix_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 3))
         self.value_matrix = ttk.Treeview(matrix_frame, show="headings", height=5)
         matrix_scroll = ttk.Scrollbar(matrix_frame, orient=tk.HORIZONTAL,
                                       command=self.value_matrix.xview)
         self.value_matrix.configure(xscrollcommand=matrix_scroll.set)
-        self.value_matrix.pack(fill=tk.X, expand=True, padx=4, pady=(3, 0))
+        self.value_matrix.pack(fill=tk.BOTH, expand=True, padx=4, pady=(3, 0))
         matrix_scroll.pack(fill=tk.X, padx=4, pady=(0, 3))
 
+        metrics_frame = ttk.LabelFrame(
+            table_frame, text=self._tr("光谱指标", "Spectral metrics"))
+        metrics_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(3, 6))
+        roi_bar = ttk.Frame(metrics_frame)
+        roi_bar.pack(fill=tk.X, padx=4, pady=4)
+        ttk.Label(roi_bar, text=self._tr("分析区间：", "Analysis range:")).pack(side=tk.LEFT)
+        ttk.Entry(roi_bar, textvariable=self.roi_start_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(roi_bar, text="–").pack(side=tk.LEFT, padx=3)
+        ttk.Entry(roi_bar, textvariable=self.roi_end_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(roi_bar, text="nm").pack(side=tk.LEFT, padx=(3, 8))
+        ttk.Button(roi_bar, text=self._tr("更新", "Update"),
+                   command=self._update_metrics_table).pack(side=tk.LEFT)
+        metric_columns = ("source", "peak", "peak_value", "integral", "centroid", "status")
+        self.metrics_tree = ttk.Treeview(metrics_frame, columns=metric_columns,
+                                         show="headings", height=5)
+        metric_headings = (
+            self._tr("光源", "Source"), self._tr("峰值波长", "Peak wavelength"),
+            self._tr("峰值", "Peak value"), self._tr("区间积分", "Range integral"),
+            self._tr("质心波长", "Centroid"), self._tr("状态", "Status"),
+        )
+        for name, title in zip(metric_columns, metric_headings):
+            self.metrics_tree.heading(name, text=title)
+            self.metrics_tree.column(name, width=125, anchor=tk.CENTER, stretch=True)
+        self.metrics_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
         self.analysis_notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    def _build_experiment_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text=self._tr("实验信息", "Experiment information"))
+        frame.pack(fill=tk.X, pady=(0, 6))
+        fields = (
+            (self._tr("实验名称", "Experiment"), self.experiment_name_var),
+            (self._tr("样品编号", "Sample ID"), self.sample_id_var),
+            (self._tr("操作人员", "Operator"), self.operator_var),
+            (self._tr("备注", "Notes"), self.notes_var),
+        )
+        for row, (label, variable) in enumerate(fields):
+            ttk.Label(frame, text=f"{label}：").grid(
+                row=row, column=0, sticky=tk.E, padx=(6, 3), pady=3)
+            ttk.Entry(frame, textvariable=variable).grid(
+                row=row, column=1, sticky=tk.EW, padx=(3, 6), pady=3)
+        frame.columnconfigure(1, weight=1)
+
+    def _build_processing_panel(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text=self._tr("数据处理", "Data processing"))
+        frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(frame, text=self._tr("显示方式：", "Display mode:")).grid(
+            row=0, column=0, sticky=tk.E, padx=(6, 3), pady=(6, 3))
+        self.display_mode_combo = ttk.Combobox(
+            frame, textvariable=self.display_mode_var,
+            values=self._display_mode_labels(), state="readonly")
+        self.display_mode_combo.grid(row=0, column=1, sticky=tk.EW, padx=(3, 6), pady=(6, 3))
+        self.display_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_analysis_views())
+        ttk.Label(frame, textvariable=self.reference_status_var, wraplength=290).grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, padx=6, pady=3)
+        ttk.Button(frame, text=self._tr("将当前测量设为参考谱", "Set current as reference"),
+                   command=self.set_reference).grid(
+                       row=2, column=0, sticky=tk.EW, padx=(6, 3), pady=(3, 6))
+        ttk.Button(frame, text=self._tr("清除参考谱", "Clear reference"),
+                   command=self.clear_reference).grid(
+                       row=2, column=1, sticky=tk.EW, padx=(3, 6), pady=(3, 6))
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+
+    def _build_records_tab(self) -> None:
+        pane = ttk.Panedwindow(self.records_tab, orient=tk.VERTICAL)
+        pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        upper = ttk.Frame(pane)
+        lower = ttk.Frame(pane)
+        pane.add(upper, weight=1)
+        pane.add(lower, weight=2)
+
+        toolbar = ttk.Frame(upper)
+        toolbar.pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(toolbar, text=self._tr("保存当前测量", "Save current measurement"),
+                   command=self.save_current_record).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text=self._tr("删除所选记录", "Delete selected"),
+                   command=self.delete_selected_records).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text=self._tr("导出记录 CSV", "Export records CSV"),
+                   command=self.export_records_csv).pack(side=tk.LEFT, padx=4)
+        ttk.Label(toolbar, text=self._tr("对比光源：", "Comparison source:")).pack(
+            side=tk.RIGHT, padx=(8, 2))
+        source_combo = ttk.Combobox(toolbar, textvariable=self.comparison_source_var,
+                                    values=LIGHTS, width=9, state="readonly")
+        source_combo.pack(side=tk.RIGHT)
+        source_combo.bind("<<ComboboxSelected>>", lambda _event: self._redraw_comparison_plot())
+
+        record_columns = ("id", "time", "experiment", "sample", "operator", "averages", "sensor")
+        self.records_tree = ttk.Treeview(upper, columns=record_columns, show="headings",
+                                         selectmode="extended", height=8)
+        record_headings = (
+            self._tr("编号", "ID"), self._tr("采集时间", "Acquired at"),
+            self._tr("实验名称", "Experiment"), self._tr("样品编号", "Sample ID"),
+            self._tr("操作人员", "Operator"), self._tr("平均次数", "Averages"),
+            self._tr("传感器", "Sensor"),
+        )
+        for name, title in zip(record_columns, record_headings):
+            self.records_tree.heading(name, text=title)
+            width = 70 if name in ("id", "averages") else 150
+            self.records_tree.column(name, width=width, anchor=tk.CENTER, stretch=True)
+        record_scroll = ttk.Scrollbar(upper, orient=tk.VERTICAL, command=self.records_tree.yview)
+        self.records_tree.configure(yscrollcommand=record_scroll.set)
+        self.records_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        record_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.records_tree.bind("<<TreeviewSelect>>", lambda _event: self._redraw_comparison_plot())
+
+        compare_toolbar = ttk.Frame(lower)
+        compare_toolbar.pack(fill=tk.X)
+        ttk.Label(compare_toolbar, text=self._tr(
+            "可多选记录叠加比较；未选择时显示最近 8 条。",
+            "Select multiple records to compare; the latest eight are shown when none are selected."))\
+            .pack(side=tk.LEFT, padx=4)
+        ttk.Button(compare_toolbar, text=self._tr("保存对比图 PNG", "Save comparison PNG"),
+                   command=self.export_comparison_plot).pack(side=tk.RIGHT)
+        self.comparison_figure = Figure(figsize=(11.5, 5.2), dpi=100)
+        self.comparison_ax = self.comparison_figure.add_subplot(111)
+        self.comparison_canvas = FigureCanvasTkAgg(self.comparison_figure, master=lower)
+        self.comparison_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        NavigationToolbar2Tk(self.comparison_canvas, lower, pack_toolbar=True)
+
+    def _build_stability_tab(self) -> None:
+        toolbar = ttk.Frame(self.stability_tab)
+        toolbar.pack(fill=tk.X, padx=8, pady=(8, 2))
+        ttk.Label(toolbar, text=self._tr(
+            "每轮完整测量自动加入稳定性序列。",
+            "Every complete measurement is added to the stability series."))\
+            .pack(side=tk.LEFT)
+        ttk.Button(toolbar, text=self._tr("导出稳定性 CSV", "Export stability CSV"),
+                   command=self.export_stability_csv).pack(side=tk.RIGHT)
+        self.stability_figure = Figure(figsize=(11.2, 7.0), dpi=100)
+        self.stability_ax = self.stability_figure.add_subplot(111)
+        self.stability_canvas = FigureCanvasTkAgg(self.stability_figure, master=self.stability_tab)
+        self.stability_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+        NavigationToolbar2Tk(self.stability_canvas, self.stability_tab, pack_toolbar=True)
 
     def _build_identity_panel(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text=self._tr("设备摘要", "Device summary"))
@@ -560,16 +758,19 @@ class AmsSpectralApp:
         frame = ttk.LabelFrame(parent, text=self._tr("数据采集", "Acquisition"))
         frame.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Button(frame, text=self._tr("读取环境光", "Read ambient"),
-                   command=lambda: self.send_command("READ")).grid(
-                       row=0, column=0, columnspan=2, sticky=tk.EW,
-                       padx=6, pady=(6, 3))
-        ttk.Button(frame, text=self._tr("四光源完整测量", "Measure all four LEDs"),
-                   command=lambda: self.send_command("MEASURE")).grid(
-                       row=1, column=0, columnspan=2, sticky=tk.EW,
-                       padx=6, pady=3)
+        ttk.Label(frame, text=self._tr("重复平均：", "Scan averaging:")).grid(
+            row=0, column=0, sticky=tk.E, padx=(6, 3), pady=(6, 3))
+        ttk.Combobox(frame, textvariable=self.average_count_var,
+                     values=("1", "3", "5", "10"), width=9,
+                     state="readonly").grid(
+                         row=0, column=1, sticky=tk.EW, padx=(3, 6), pady=(6, 3))
+        self.capture_button = ttk.Button(
+            frame, text=self._tr("采集并保存实验记录", "Acquire and save record"),
+            command=self.start_averaged_capture)
+        self.capture_button.grid(row=1, column=0, columnspan=2, sticky=tk.EW,
+                                 padx=6, pady=3)
 
-        ttk.Label(frame, text=self._tr("连续周期 (ms)：", "Stream interval (ms):")).grid(
+        ttk.Label(frame, text=self._tr("实时周期 (ms)：", "Live interval (ms):")).grid(
             row=2, column=0, sticky=tk.E, padx=(6, 3), pady=(7, 3))
         ttk.Entry(frame, textvariable=self.stream_interval_var, width=10).grid(
             row=2, column=1, sticky=tk.EW, padx=(3, 6), pady=(7, 3))
@@ -578,11 +779,13 @@ class AmsSpectralApp:
         self.stream_button.grid(row=3, column=0, columnspan=2, sticky=tk.EW,
                                 padx=6, pady=3)
         ttk.Button(frame, text=self._tr("停止采集", "Stop acquisition"),
-                   command=lambda: self.send_command("STOP")).grid(
+                   command=self.stop_acquisition).grid(
                        row=4, column=0, sticky=tk.EW, padx=(6, 3), pady=(3, 6))
-        ttk.Button(frame, text=self._tr("清空图表", "Clear charts"),
+        ttk.Button(frame, text=self._tr("清空当前数据", "Clear current data"),
                    command=self.clear_measurements).grid(
                        row=4, column=1, sticky=tk.EW, padx=(3, 6), pady=(3, 6))
+        ttk.Label(frame, textvariable=self.capture_status_var, wraplength=295).grid(
+            row=5, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 6))
         frame.columnconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
 
@@ -830,6 +1033,9 @@ class AmsSpectralApp:
         self.connection_var.set(self._tr("未连接", "Disconnected"))
         self.connect_button.configure(text=self._tr("连接", "Connect"))
         self.stream_active = False
+        self.capture_active = False
+        self.capture_buffer.clear()
+        self.capture_button.configure(state=tk.NORMAL)
         self.stream_button.configure(text=self._tr("开始连续读取", "Start streaming"))
         self.identity.status = "DISCONNECTED"
         self._update_identity_display()
@@ -871,6 +1077,233 @@ class AmsSpectralApp:
         )
         if path:
             Path(path).write_text(self.log_text.get("1.0", tk.END), encoding="utf-8")
+
+    # ---------- 实验采集与数据处理 ----------
+
+    @staticmethod
+    def _copy_frame(frame: SpectrumFrame) -> SpectrumFrame:
+        return SpectrumFrame(
+            sequence=frame.sequence,
+            source=frame.source,
+            gain_index=frame.gain_index,
+            gain_x1000=frame.gain_x1000,
+            atime=frame.atime,
+            astep=frame.astep,
+            tint_us=frame.tint_us,
+            temperature_x10=frame.temperature_x10,
+            light_flags=frame.light_flags,
+            dark_flags=frame.dark_flags,
+            light=list(frame.light),
+            dark=list(frame.dark),
+        )
+
+    def _copy_frames(self, frames: dict[str, SpectrumFrame]) -> dict[str, SpectrumFrame]:
+        return {source: self._copy_frame(frame) for source, frame in frames.items()}
+
+    def start_averaged_capture(self) -> None:
+        """按用户设定的次数采集，并生成一条实验记录。"""
+        if not self.serial.connected:
+            messagebox.showwarning(
+                self._tr("实验采集", "Experiment acquisition"),
+                self._tr("请先连接设备。", "Connect the device first."))
+            return
+        if self.capture_active:
+            return
+        try:
+            target = int(self.average_count_var.get())
+            if target not in (1, 3, 5, 10):
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning(
+                self._tr("重复平均", "Scan averaging"),
+                self._tr("平均次数应为 1、3、5 或 10。",
+                         "The averaging count must be 1, 3, 5, or 10."))
+            return
+
+        if self.stream_active:
+            self.send_command("STOP")
+            self.stream_active = False
+            self.stream_button.configure(text=self._tr("开始连续读取", "Start streaming"))
+        self.capture_target = target
+        self.capture_buffer.clear()
+        self.capture_active = True
+        self.capture_button.configure(state=tk.DISABLED)
+        self.capture_status_var.set(self._tr(
+            f"正在采集 1/{target}", f"Acquiring 1/{target}"))
+        self.root.after(180 if target > 1 else 0, lambda: self.send_command("MEASURE"))
+
+    def stop_acquisition(self) -> None:
+        self.capture_active = False
+        self.capture_buffer.clear()
+        self.stream_active = False
+        if self.serial.connected:
+            self.send_command("STOP")
+        self.capture_button.configure(state=tk.NORMAL)
+        self.stream_button.configure(text=self._tr("开始连续读取", "Start streaming"))
+        self.capture_status_var.set(self._tr("采集已停止", "Acquisition stopped"))
+
+    def _average_frame_sets(
+            self, frame_sets: list[dict[str, SpectrumFrame]]) -> dict[str, SpectrumFrame]:
+        """将不同自动增益/积分时间的结果折算到末次曝光条件后平均。"""
+        averaged: dict[str, SpectrumFrame] = {}
+        for source in LIGHTS:
+            source_frames = [frames[source] for frames in frame_sets if source in frames]
+            if not source_frames:
+                continue
+            target = source_frames[-1]
+            count = len(target.light)
+            net_sum = [0.0] * count
+            dark_sum = [0.0] * count
+            light_flags = 0
+            dark_flags = 0
+            temperatures: list[int] = []
+            target_gain = max(target.gain_x1000, 1)
+            target_tint = max(target.tint_us, 1)
+            for frame in source_frames:
+                scale = ((target_gain / max(frame.gain_x1000, 1)) *
+                         (target_tint / max(frame.tint_us, 1)))
+                for index in range(count):
+                    net_sum[index] += self._safe_at(frame.net, index) * scale
+                    dark_sum[index] += self._safe_at(frame.dark, index) * scale
+                light_flags |= frame.light_flags
+                dark_flags |= frame.dark_flags
+                temperatures.append(frame.temperature_x10)
+            divisor = float(len(source_frames))
+            dark = [max(0, round(value / divisor)) for value in dark_sum]
+            net = [max(0, round(value / divisor)) for value in net_sum]
+            averaged[source] = SpectrumFrame(
+                sequence=target.sequence,
+                source=source,
+                gain_index=target.gain_index,
+                gain_x1000=target.gain_x1000,
+                atime=target.atime,
+                astep=target.astep,
+                tint_us=target.tint_us,
+                temperature_x10=round(sum(temperatures) / len(temperatures)),
+                light_flags=light_flags,
+                dark_flags=dark_flags,
+                light=[base + signal for base, signal in zip(dark, net)],
+                dark=dark,
+            )
+        return averaged
+
+    def _current_signature(self) -> tuple[str, str, tuple[str, ...]]:
+        return (self.identity.family, self.identity.effective_profile, tuple(self.channels))
+
+    def _reference_is_valid(self) -> bool:
+        return bool(self.reference_measurements) and self.reference_signature == self._current_signature()
+
+    def set_reference(self) -> None:
+        if not all(source in self.measurements for source in LIGHTS):
+            messagebox.showinfo(
+                self._tr("参考谱", "Reference spectrum"),
+                self._tr("请先完成一次四光源测量。",
+                         "Complete one four-source measurement first."))
+            return
+        self.reference_measurements = self._copy_frames(self.measurements)
+        self.reference_signature = self._current_signature()
+        self._update_reference_status()
+        self._refresh_analysis_views()
+        self.log("SYS", self._tr("当前测量已设为参考谱。",
+                                 "The current measurement was set as the reference."))
+
+    def clear_reference(self, reason: str = "") -> None:
+        had_reference = bool(self.reference_measurements)
+        self.reference_measurements.clear()
+        self.reference_signature = None
+        self._update_reference_status()
+        if self._display_mode_code() != "NET":
+            self._set_display_mode_code("NET")
+        if hasattr(self, "spectrum_ax"):
+            self._refresh_analysis_views()
+        if had_reference and reason:
+            self.log("SYS", reason)
+
+    def _update_reference_status(self) -> None:
+        if self._reference_is_valid():
+            sequence = max(frame.sequence for frame in self.reference_measurements.values())
+            self.reference_status_var.set(self._tr(
+                f"参考谱：测量 {sequence}（已按暗场校正）",
+                f"Reference: measurement {sequence} (dark corrected)"))
+        elif self.reference_measurements:
+            self.reference_status_var.set(self._tr(
+                "参考谱与当前传感器配置不匹配",
+                "Reference does not match the current sensor profile"))
+        else:
+            self.reference_status_var.set(self._tr("未设置参考谱", "No reference set"))
+
+    @staticmethod
+    def _normalized_rate(frame: SpectrumFrame, index: int) -> float:
+        gain = max(frame.gain_x1000 / 1000.0, 0.001)
+        tint_s = max(frame.tint_us / 1_000_000.0, 0.000001)
+        net = frame.net[index] if 0 <= index < len(frame.net) else 0
+        return float(net) / gain / tint_s
+
+    def _processed_values(
+            self, frames: dict[str, SpectrumFrame], source: str,
+            mode: Optional[str] = None) -> list[float]:
+        frame = frames.get(source)
+        if frame is None:
+            return [0.0] * len(self.channels)
+        active_mode = mode or self._display_mode_code()
+        if active_mode == "NET":
+            return [float(value) for value in frame.net]
+        if not self._reference_is_valid():
+            return [math.nan] * len(self.channels)
+        reference = self.reference_measurements.get(source)
+        if reference is None:
+            return [math.nan] * len(self.channels)
+        result: list[float] = []
+        for index in range(len(self.channels)):
+            sample_rate = self._normalized_rate(frame, index)
+            reference_rate = self._normalized_rate(reference, index)
+            if reference_rate <= 0.0:
+                result.append(math.nan)
+                continue
+            ratio = max(sample_rate / reference_rate, 1e-12)
+            if active_mode == "RELATIVE":
+                result.append(100.0 * ratio)
+            else:
+                result.append(-math.log10(ratio))
+        return result
+
+    def _create_experiment_record(self, average_count: int) -> Optional[ExperimentRecord]:
+        if not all(source in self.measurements for source in LIGHTS):
+            return None
+        record = ExperimentRecord(
+            record_id=self.next_record_id,
+            timestamp=datetime.now(),
+            experiment_name=self.experiment_name_var.get().strip(),
+            sample_id=self.sample_id_var.get().strip(),
+            operator=self.operator_var.get().strip(),
+            notes=self.notes_var.get().strip(),
+            sensor_family=self.identity.family,
+            effective_profile=self.identity.effective_profile,
+            channels=list(self.channels),
+            frames=self._copy_frames(self.measurements),
+            average_count=average_count,
+        )
+        self.experiment_records.append(record)
+        self.next_record_id += 1
+        self._rebuild_records_tree()
+        self._redraw_comparison_plot()
+        return record
+
+    def save_current_record(self) -> None:
+        record = self._create_experiment_record(self.last_average_count)
+        if record is None:
+            messagebox.showinfo(
+                self._tr("实验记录", "Experiment record"),
+                self._tr("当前没有完整的四光源测量可保存。",
+                         "There is no complete four-source measurement to save."))
+            return
+        self.capture_status_var.set(self._tr(
+            f"已保存记录 #{record.record_id}", f"Saved record #{record.record_id}"))
+
+    def _refresh_analysis_views(self) -> None:
+        self._update_spectrum_table()
+        self._redraw_spectrum_plot()
+        self._redraw_comparison_plot()
 
     def _process_events(self) -> None:
         try:
@@ -967,6 +1400,9 @@ class AmsSpectralApp:
                 elif tokens[1].upper() == "PROFILE":
                     kv = self._kv(tokens[2:])
                     if kv.get("STATUS") == "OK":
+                        self.clear_reference(self._tr(
+                            "数据配置已改变，参考谱已清除。",
+                            "The data profile changed; the reference was cleared."))
                         self.last_frame_var.set(
                             self._tr(
                                 f"数据解释配置已切换：{kv.get('EFFECTIVE', self.profile_var.get())}",
@@ -1015,6 +1451,10 @@ class AmsSpectralApp:
         self._update_identity_display()
         self._update_gain_options()
         self._update_profile_options()
+        if self.reference_measurements and not self._reference_is_valid():
+            self.clear_reference(self._tr(
+                "传感器或数据配置已改变，参考谱已清除。",
+                "The sensor or data profile changed; the reference was cleared."))
 
     def _handle_sensor(self, kv: dict[str, str]) -> None:
         self.identity.status = kv.get("STATUS", self.identity.status)
@@ -1040,6 +1480,10 @@ class AmsSpectralApp:
         self._update_identity_display()
         self._update_gain_options()
         self._update_profile_options()
+        if self.reference_measurements and not self._reference_is_valid():
+            self.clear_reference(self._tr(
+                "传感器或数据配置已改变，参考谱已清除。",
+                "The sensor or data profile changed; the reference was cleared."))
 
         fingerprint = self.identity.fingerprint()
         if self.last_identity_fingerprint is not None and fingerprint != self.last_identity_fingerprint:
@@ -1138,6 +1582,9 @@ class AmsSpectralApp:
             self.measurements.clear()
             self.current_measurement_sequence = None
             self._rebuild_spectrum_table()
+            self.clear_reference(self._tr(
+                "通道表已改变，参考谱已清除。",
+                "The channel map changed; the reference was cleared."))
             self._redraw_spectrum_plot()
             self.log("SYS", self._tr(
                 f"通道表已切换为 {len(names)} 通道：{', '.join(names)}",
@@ -1208,7 +1655,7 @@ class AmsSpectralApp:
         self._redraw_spectrum_plot()
 
     def _finish_measurement(self, sequence: int) -> None:
-        """记录一轮稳定性指标。"""
+        """记录稳定性指标，并推进重复平均采集。"""
         if self.measurements:
             snapshot: dict[str, Any] = {"sequence": sequence, "time": time.time()}
             spectral_indices = [item[0] for item in self._spectral_channel_layout()]
@@ -1216,11 +1663,13 @@ class AmsSpectralApp:
                 frame = self.measurements.get(light)
                 if frame:
                     gain = max(frame.gain_x1000 / 1000.0, 0.5)
+                    tint_s = max(frame.tint_us / 1_000_000.0, 0.000001)
                     spectral_net = [self._safe_at(frame.net, idx)
                                     for idx in spectral_indices]
                     snapshot[light] = {
                         "sum_net": float(sum(spectral_net)),
                         "sum_net_1x": float(sum(spectral_net)) / gain,
+                        "sum_net_rate": float(sum(spectral_net)) / gain / tint_s,
                         "peak": float(max(spectral_net, default=0)),
                         "gain": frame.gain_index,
                         "flags": frame.light_flags | frame.dark_flags,
@@ -1234,6 +1683,39 @@ class AmsSpectralApp:
             f"完整测量完成，序号 {sequence}｜稳定性记录 {len(self.measurement_history)} 组",
             f"Full measurement {sequence} complete | {len(self.measurement_history)} stability records"))
         self._redraw_stability_plot()
+
+        if not self.capture_active:
+            return
+        if not all(source in self.measurements for source in LIGHTS):
+            self.capture_active = False
+            self.capture_button.configure(state=tk.NORMAL)
+            self.capture_status_var.set(self._tr(
+                "本轮数据不完整，采集已停止",
+                "The frame set was incomplete; acquisition stopped"))
+            return
+
+        self.capture_buffer.append(self._copy_frames(self.measurements))
+        completed = len(self.capture_buffer)
+        if completed < self.capture_target:
+            self.capture_status_var.set(self._tr(
+                f"正在采集 {completed + 1}/{self.capture_target}",
+                f"Acquiring {completed + 1}/{self.capture_target}"))
+            self.root.after(180, lambda: self.send_command("MEASURE"))
+            return
+
+        self.measurements = self._average_frame_sets(self.capture_buffer)
+        self.last_average_count = self.capture_target
+        self.capture_active = False
+        self.capture_buffer.clear()
+        self.capture_button.configure(state=tk.NORMAL)
+        record = self._create_experiment_record(self.last_average_count)
+        if record:
+            self.capture_status_var.set(self._tr(
+                f"采集完成，已保存记录 #{record.record_id}（{self.last_average_count} 次平均）",
+                f"Acquisition complete; record #{record.record_id} saved "
+                f"({self.last_average_count} scans averaged)"))
+        self._update_spectrum_table()
+        self._redraw_spectrum_plot()
 
     def _handle_temperature(self, kv: dict[str, str]) -> None:
         status = kv.get("STATUS", "UNKNOWN")
@@ -1263,11 +1745,6 @@ class AmsSpectralApp:
     # ---------- 数据展示 ----------
 
     def _rebuild_spectrum_table(self) -> None:
-        for item in self.spectrum_tree.get_children():
-            self.spectrum_tree.delete(item)
-        for name in self.channels:
-            self.spectrum_tree.insert("", tk.END, iid=name,
-                                      values=(name, 0, 0, 0, 0, 0, 0))
         self._rebuild_value_matrix()
         self._update_spectrum_table()
 
@@ -1293,8 +1770,13 @@ class AmsSpectralApp:
 
     def _update_value_matrix(self) -> None:
         count = len(self.channels)
-        ambient_values = [self._safe_at(self.ambient, index)
-                          for index in range(count)]
+        mode = self._display_mode_code()
+        ambient_values: list[int | str]
+        if mode == "NET":
+            ambient_values = [self._safe_at(self.ambient, index)
+                              for index in range(count)]
+        else:
+            ambient_values = ["—"] * count
         if self.value_matrix.exists("matrix_ambient"):
             self.value_matrix.item(
                 "matrix_ambient",
@@ -1302,34 +1784,36 @@ class AmsSpectralApp:
 
         for light in LIGHTS:
             frame = self.measurements.get(light)
-            channel_values: list[int | str]
+            channel_values: list[float | int | str]
             if frame is None:
                 channel_values = ["—"] * count
             else:
-                channel_values = [self._safe_at(frame.net, index)
-                                  for index in range(count)]
+                channel_values = [self._format_processed_value(value, mode)
+                                  for value in self._processed_values(self.measurements, light, mode)]
             item = f"matrix_{light}"
             if self.value_matrix.exists(item):
+                suffix = {
+                    "NET": self._tr("净值", "net"),
+                    "RELATIVE": self._tr("相对响应", "relative"),
+                    "ABSORBANCE": self._tr("吸光度", "absorbance"),
+                }[mode]
                 self.value_matrix.item(
                     item,
                     values=[self._tr(
-                        self._light_label(light) + " 净值",
-                        self._light_label(light) + " net")] + channel_values)
+                        self._light_label(light) + " " + suffix,
+                        self._light_label(light) + " " + suffix)] + channel_values)
 
     def _update_spectrum_table(self) -> None:
-        count = len(self.channels)
-        dark = [0] * count
-        if self.measurements:
-            latest = max(self.measurements.values(), key=lambda x: (x.sequence, x.source))
-            dark = latest.dark
-        for idx, name in enumerate(self.channels):
-            values = [name, self._safe_at(self.ambient, idx), self._safe_at(dark, idx)]
-            for light in LIGHTS:
-                frame = self.measurements.get(light)
-                values.append(self._safe_at(frame.net, idx) if frame else 0)
-            if self.spectrum_tree.exists(name):
-                self.spectrum_tree.item(name, values=values)
         self._update_value_matrix()
+        self._update_metrics_table()
+
+    @staticmethod
+    def _format_processed_value(value: float, mode: str) -> float | int | str:
+        if not math.isfinite(value):
+            return "—"
+        if mode == "NET":
+            return round(value)
+        return f"{value:.4f}" if mode == "ABSORBANCE" else f"{value:.2f}"
 
     @staticmethod
     def _safe_at(values: list[int], index: int) -> int:
@@ -1351,117 +1835,237 @@ class AmsSpectralApp:
         return result
 
     def _redraw_spectrum_plot(self) -> None:
-        axes = (self.net_ax, self.normalized_ax, self.heatmap_ax, self.quality_ax)
-        for ax in axes:
-            ax.clear()
-        positions = list(range(len(self.channels)))
+        ax = self.spectrum_ax
+        ax.clear()
+        mode = self._display_mode_code()
         spectral_layout = self._spectral_channel_layout()
         spectral_indices = [item[0] for item in spectral_layout]
         spectral_x = [item[1] for item in spectral_layout]
-        wavelength_ticks: list[int] = []
-        if spectral_x:
-            tick_start = (min(spectral_x) // 50) * 50
-            tick_stop = ((max(spectral_x) + 49) // 50) * 50
-            wavelength_ticks = list(range(tick_start, tick_stop + 1, 50))
-
-        # 仅绘制有中心波长的通道。
-        ambient_spectral = [self._safe_at(self.ambient, idx)
-                            for idx in spectral_indices]
-        if any(ambient_spectral):
-            self.net_ax.plot(spectral_x, ambient_spectral, marker="o",
-                             label=self._tr("环境光", "Ambient"))
-        for light in LIGHTS:
-            frame = self.measurements.get(light)
-            if frame:
-                spectral_net = [self._safe_at(frame.net, idx)
-                                for idx in spectral_indices]
-                self.net_ax.plot(spectral_x, spectral_net, marker="o",
-                                 label=self._tr(
-                                     f"{self._light_label(light)} 净响应",
-                                     f"{self._light_label(light)} net response"))
-        self.net_ax.set_title(self._tr("暗场扣除后净响应", "Dark-subtracted response"))
-        self.net_ax.set_ylabel(self._tr("ADC 计数", "ADC counts"))
-
-        # 每路光源按自身峰值归一化。
-        for light in LIGHTS:
-            frame = self.measurements.get(light)
-            if frame:
-                spectral_net = [self._safe_at(frame.net, idx)
-                                for idx in spectral_indices]
-                peak = max(spectral_net, default=0)
-                normalized = [value / peak if peak > 0 else 0.0
-                              for value in spectral_net]
-                self.normalized_ax.plot(spectral_x, normalized, marker="o",
-                                        label=self._light_label(light))
-        self.normalized_ax.set_title(
-            self._tr("峰值归一化谱形", "Peak-normalized spectral shape"))
-        self.normalized_ax.set_ylabel(self._tr("相对响应 (0–1)", "Relative response (0–1)"))
-        self.normalized_ax.set_ylim(-0.03, 1.08)
-
-        # 热图逐行归一化。
-        heat_rows: list[list[float]] = []
-        heat_labels: list[str] = []
-        for light in LIGHTS:
-            frame = self.measurements.get(light)
-            if frame:
-                peak = max(frame.net, default=0)
-                heat_rows.append([value / peak if peak > 0 else 0.0 for value in frame.net])
-                heat_labels.append(self._light_label(light))
-        if heat_rows:
-            image = self.heatmap_ax.imshow(heat_rows, aspect="auto", vmin=0.0, vmax=1.0,
-                                           interpolation="nearest", cmap="viridis")
-            self.heatmap_ax.set_yticks(range(len(heat_labels)))
-            self.heatmap_ax.set_yticklabels(heat_labels)
-            self.heatmap_ax.set_title(
-                self._tr("光源–通道归一化热图", "Normalized source-channel heatmap"))
-            # 刷新时复用色标轴。
-            image.set_clim(0.0, 1.0)
+        if mode != "NET" and not self._reference_is_valid():
+            ax.text(0.5, 0.5, self._tr(
+                "请先采集样品并设置参考谱",
+                "Acquire a measurement and set it as the reference first"),
+                    transform=ax.transAxes, ha="center", va="center", fontsize=13)
         else:
-            self.heatmap_ax.set_title(
-                self._tr("光源–通道归一化热图", "Normalized source-channel heatmap"))
+            if mode == "NET":
+                ambient_spectral = [self._safe_at(self.ambient, idx)
+                                    for idx in spectral_indices]
+                if any(ambient_spectral):
+                    ax.plot(spectral_x, ambient_spectral, marker="o", linestyle="--",
+                            alpha=0.65, label=self._tr("环境光", "Ambient"))
+            for light in LIGHTS:
+                if light not in self.measurements:
+                    continue
+                values = self._processed_values(self.measurements, light, mode)
+                y = [values[index] for index in spectral_indices]
+                ax.plot(spectral_x, y, marker="o", linewidth=1.8,
+                        label=self._light_label(light))
 
-        # 净信号占亮场比例（非统计 SNR）。
-        quality_labels: list[str] = []
-        quality_values: list[float] = []
-        quality_colors: list[str] = []
-        for light in LIGHTS:
-            frame = self.measurements.get(light)
-            if frame:
-                light_sum = sum(self._safe_at(frame.light, idx)
-                                for idx in spectral_indices)
-                net_sum = sum(self._safe_at(frame.net, idx)
-                              for idx in spectral_indices)
-                fraction = 100.0 * net_sum / light_sum if light_sum > 0 else 0.0
-                quality_labels.append(self._light_label(light))
-                quality_values.append(fraction)
-                quality_colors.append("tab:red" if (frame.light_flags | frame.dark_flags) else "tab:blue")
-        if quality_values:
-            bars = self.quality_ax.bar(quality_labels, quality_values, color=quality_colors)
-            for bar, value in zip(bars, quality_values):
-                self.quality_ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                                     f"{value:.1f}%", ha="center", va="bottom", fontsize=8)
-        self.quality_ax.set_title(self._tr(
-            "有效净信号占亮场比例", "Usable net signal as a fraction of lit signal"))
-        self.quality_ax.set_ylabel(self._tr("净信号 / 亮场 (%)", "Net / lit signal (%)"))
-
-        for ax in axes:
-            ax.grid(True, alpha=0.22)
-        for ax in (self.net_ax, self.normalized_ax):
-            ax.set_xlabel(self._tr("典型峰值波长 (nm)", "Nominal peak wavelength (nm)"))
-            ax.set_xticks(wavelength_ticks)
-            if spectral_x:
-                ax.set_xlim(min(spectral_x) - 12, max(spectral_x) + 12)
-        self.heatmap_ax.set_xlabel(self._tr(
-            "传感器通道（含 CLEAR / FD_RAW）", "Sensor channels (including CLEAR / FD_RAW)"))
-        self.heatmap_ax.set_xticks(positions)
-        self.heatmap_ax.set_xticklabels(self.channels, rotation=45,
-                                        ha="right", fontsize=7)
-        self.quality_ax.set_xlabel(self._tr("激发光源", "Illumination source"))
-        for ax in (self.net_ax, self.normalized_ax):
-            if ax.lines:
-                ax.legend(loc="best", fontsize=7)
-        self.spectrum_figure.tight_layout(h_pad=2.4)
+        title, ylabel = {
+            "NET": (self._tr("暗场扣除后的实时光谱", "Live dark-subtracted spectra"),
+                    self._tr("ADC 计数", "ADC counts")),
+            "RELATIVE": (self._tr("相对于参考谱的响应", "Response relative to reference"),
+                         self._tr("相对响应 (%)", "Relative response (%)")),
+            "ABSORBANCE": (self._tr("吸光度光谱", "Absorbance spectra"),
+                           self._tr("吸光度 (AU)", "Absorbance (AU)")),
+        }[mode]
+        ax.set_title(title)
+        ax.set_xlabel(self._tr("典型峰值波长 (nm)", "Nominal peak wavelength (nm)"))
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        if spectral_x:
+            ax.set_xlim(min(spectral_x) - 12, max(spectral_x) + 12)
+        if ax.lines:
+            ax.legend(loc="best", ncols=2)
+        self.spectrum_figure.tight_layout()
         self.spectrum_canvas.draw_idle()
+        self._redraw_heatmap()
+        self._update_metrics_table()
+
+    def _redraw_heatmap(self) -> None:
+        ax = self.heatmap_ax
+        ax.clear()
+        mode = self._display_mode_code()
+        rows: list[list[float]] = []
+        labels: list[str] = []
+        for light in LIGHTS:
+            if light not in self.measurements:
+                continue
+            values = self._processed_values(self.measurements, light, mode)
+            finite = [value for value in values if math.isfinite(value)]
+            if mode == "NET":
+                peak = max(finite, default=0.0)
+                values = [value / peak if peak > 0 else 0.0 for value in values]
+            rows.append([value if math.isfinite(value) else 0.0 for value in values])
+            labels.append(self._light_label(light))
+        if rows:
+            image = ax.imshow(rows, aspect="auto", interpolation="nearest",
+                              cmap="viridis" if mode != "ABSORBANCE" else "magma")
+            if mode == "NET":
+                image.set_clim(0.0, 1.0)
+            ax.set_yticks(range(len(labels)))
+            ax.set_yticklabels(labels)
+        ax.set_title(self._tr(
+            "四光源与全部接收通道热图",
+            "Four-source and full-channel heatmap"))
+        ax.set_xlabel(self._tr("传感器通道", "Sensor channel"))
+        ax.set_xticks(range(len(self.channels)))
+        ax.set_xticklabels(self.channels, rotation=38, ha="right")
+        self.heatmap_figure.tight_layout()
+        self.heatmap_canvas.draw_idle()
+
+    def _update_metrics_table(self) -> None:
+        if not hasattr(self, "metrics_tree"):
+            return
+        for item in self.metrics_tree.get_children():
+            self.metrics_tree.delete(item)
+        try:
+            roi_start = float(self.roi_start_var.get())
+            roi_end = float(self.roi_end_var.get())
+        except ValueError:
+            roi_start, roi_end = 400.0, 900.0
+        if roi_start > roi_end:
+            roi_start, roi_end = roi_end, roi_start
+        mode = self._display_mode_code()
+        layout = [(index, wavelength, name) for index, wavelength, name
+                  in self._spectral_channel_layout() if roi_start <= wavelength <= roi_end]
+        for source in LIGHTS:
+            frame = self.measurements.get(source)
+            if frame is None or not layout:
+                continue
+            values = self._processed_values(self.measurements, source, mode)
+            points = [(wavelength, values[index]) for index, wavelength, _name in layout
+                      if index < len(values) and math.isfinite(values[index])]
+            if not points:
+                continue
+            peak_nm, peak_value = max(points, key=lambda item: item[1])
+            integral = 0.0
+            for (x0, y0), (x1, y1) in zip(points, points[1:]):
+                integral += (x1 - x0) * (y0 + y1) / 2.0
+            positive_weights = [max(value, 0.0) for _nm, value in points]
+            total_weight = sum(positive_weights)
+            centroid = (sum(nm * weight for (nm, _value), weight
+                            in zip(points, positive_weights)) / total_weight
+                        if total_weight > 0 else float(peak_nm))
+            flags = frame.light_flags | frame.dark_flags
+            status = (self._tr(f"检查 0x{flags:02X}", f"Check 0x{flags:02X}")
+                      if flags else self._tr("正常", "OK"))
+            self.metrics_tree.insert("", tk.END, values=(
+                self._light_label(source), f"{peak_nm} nm",
+                self._format_processed_value(peak_value, mode), f"{integral:.2f}",
+                f"{centroid:.1f} nm", status,
+            ))
+
+    def _on_spectrum_motion(self, event: Any) -> None:
+        if event.inaxes is not self.spectrum_ax or event.xdata is None or event.ydata is None:
+            self.cursor_var.set("")
+            return
+        layout = self._spectral_channel_layout()
+        if not layout:
+            return
+        index, wavelength, name = min(layout, key=lambda item: abs(item[1] - event.xdata))
+        self.cursor_var.set(self._tr(
+            f"光标：{event.xdata:.1f} nm / {event.ydata:.3f}；最近通道 {name} ({wavelength} nm)",
+            f"Cursor: {event.xdata:.1f} nm / {event.ydata:.3f}; nearest channel {name} ({wavelength} nm)"))
+
+    def _rebuild_records_tree(self) -> None:
+        if not hasattr(self, "records_tree"):
+            return
+        selected = set(self.records_tree.selection())
+        for item in self.records_tree.get_children():
+            self.records_tree.delete(item)
+        for record in self.experiment_records:
+            iid = f"record_{record.record_id}"
+            self.records_tree.insert("", tk.END, iid=iid, values=(
+                record.record_id, record.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                record.experiment_name, record.sample_id, record.operator,
+                record.average_count, record.sensor_family,
+            ))
+            if iid in selected:
+                self.records_tree.selection_add(iid)
+
+    def _selected_records(self) -> list[ExperimentRecord]:
+        selected_ids = {
+            self._parse_int(item.removeprefix("record_"), -1)
+            for item in self.records_tree.selection()
+        } if hasattr(self, "records_tree") else set()
+        if selected_ids:
+            return [record for record in self.experiment_records
+                    if record.record_id in selected_ids]
+        return self.experiment_records[-8:]
+
+    def delete_selected_records(self) -> None:
+        selected = self.records_tree.selection()
+        if not selected:
+            return
+        selected_ids = {self._parse_int(item.removeprefix("record_"), -1)
+                        for item in selected}
+        self.experiment_records = [record for record in self.experiment_records
+                                   if record.record_id not in selected_ids]
+        self._rebuild_records_tree()
+        self._redraw_comparison_plot()
+        self.capture_status_var.set(self._tr(
+            f"已保存 {len(self.experiment_records)} 条实验记录",
+            f"{len(self.experiment_records)} experiment records saved"))
+
+    def _record_values(self, record: ExperimentRecord, source: str) -> list[float]:
+        frame = record.frames.get(source)
+        if frame is None:
+            return [0.0] * len(record.channels)
+        mode = self._display_mode_code()
+        if mode == "NET":
+            return [float(value) for value in frame.net]
+        if (not self._reference_is_valid() or record.channels != self.channels or
+                source not in self.reference_measurements):
+            return [math.nan] * len(record.channels)
+        reference = self.reference_measurements[source]
+        result: list[float] = []
+        for index in range(len(record.channels)):
+            sample_rate = self._normalized_rate(frame, index)
+            reference_rate = self._normalized_rate(reference, index)
+            if reference_rate <= 0:
+                result.append(math.nan)
+                continue
+            ratio = max(sample_rate / reference_rate, 1e-12)
+            result.append(100.0 * ratio if mode == "RELATIVE" else -math.log10(ratio))
+        return result
+
+    def _redraw_comparison_plot(self) -> None:
+        if not hasattr(self, "comparison_ax"):
+            return
+        ax = self.comparison_ax
+        ax.clear()
+        source = self.comparison_source_var.get()
+        for record in self._selected_records():
+            frame = record.frames.get(source)
+            if frame is None:
+                continue
+            layout: list[tuple[int, int]] = []
+            for index, name in enumerate(record.channels):
+                wavelength = self._channel_peak_nm(name)
+                if wavelength is not None:
+                    layout.append((index, wavelength))
+            values = self._record_values(record, source)
+            x = [wavelength for _index, wavelength in layout]
+            y = [values[index] for index, _wavelength in layout]
+            ax.plot(x, y, marker="o", label=(
+                f"#{record.record_id} {record.sample_id or record.experiment_name or '-'}"))
+        mode = self._display_mode_code()
+        ylabel = {
+            "NET": self._tr("ADC 计数", "ADC counts"),
+            "RELATIVE": self._tr("相对响应 (%)", "Relative response (%)"),
+            "ABSORBANCE": self._tr("吸光度 (AU)", "Absorbance (AU)"),
+        }[mode]
+        ax.set_title(self._tr(
+            f"{self._light_label(source)} 条件下的样品对比",
+            f"Sample comparison under {self._light_label(source)}"))
+        ax.set_xlabel(self._tr("典型峰值波长 (nm)", "Nominal peak wavelength (nm)"))
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        if ax.lines:
+            ax.legend(loc="best", ncols=2, fontsize=8)
+        self.comparison_figure.tight_layout()
+        self.comparison_canvas.draw_idle()
 
     def _redraw_stability_plot(self) -> None:
         ax = self.stability_ax
@@ -1474,16 +2078,16 @@ class AmsSpectralApp:
                 metric = item.get(light)
                 if metric:
                     x.append(sequence)
-                    y.append(float(metric["sum_net_1x"]))
+                    y.append(float(metric.get("sum_net_rate", metric["sum_net_1x"])))
             if y:
                 ax.plot(x, y, marker="o", label=self._tr(
-                    f"{self._light_label(light)} 增益归一化积分",
-                    f"{self._light_label(light)} gain-normalized integral"))
+                    f"{self._light_label(light)} 归一化积分",
+                    f"{self._light_label(light)} normalized integral"))
         ax.set_title(self._tr(
-            "重复测量稳定性（折算到 1× 增益）",
-            "Repeated-measurement stability (normalized to 1× gain)"))
+            "重复测量稳定性（按增益和积分时间归一化）",
+            "Repeated-measurement stability (gain and integration normalized)"))
         ax.set_xlabel(self._tr("测量序号", "Measurement sequence"))
-        ax.set_ylabel(self._tr("通道净信号总和 / 增益", "Sum of net channels / gain"))
+        ax.set_ylabel(self._tr("净信号总和 / 增益 / 秒", "Sum of net channels / gain / second"))
         ax.grid(True, alpha=0.25)
         if ax.lines:
             ax.legend(loc="best")
@@ -1508,28 +2112,60 @@ class AmsSpectralApp:
     def clear_measurements(self) -> None:
         self.ambient = [0] * len(self.channels)
         self.measurements.clear()
-        self.measurement_history.clear()
         self.current_measurement_sequence = None
+        self.capture_active = False
+        self.capture_buffer.clear()
+        self.capture_button.configure(state=tk.NORMAL)
         self._update_spectrum_table()
         self._redraw_spectrum_plot()
-        self._redraw_stability_plot()
-        self.last_frame_var.set(self._tr("数据已清空", "Data cleared"))
+        self.last_frame_var.set(self._tr("当前数据已清空", "Current data cleared"))
+        self.capture_status_var.set(self._tr("就绪", "Ready"))
+
+    @staticmethod
+    def _filename_part(value: str, fallback: str) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", value.strip())
+        return cleaned.strip("_") or fallback
 
     def export_current_csv(self) -> None:
+        if not self.measurements and not any(self.ambient):
+            messagebox.showinfo(
+                self._tr("导出数据", "Export data"),
+                self._tr("尚无可导出的测量数据。", "There is no measurement data to export."))
+            return
+        sample = self._filename_part(self.sample_id_var.get(), "sample")
         path = filedialog.asksaveasfilename(
             title=self._tr("导出当前光谱数据", "Export current spectral data"),
             defaultextension=".csv",
             filetypes=[(self._tr("CSV 文件", "CSV files"), "*.csv"),
                        (self._tr("所有文件", "All files"), "*.*")],
-            initialfile=f"ams_spectral_{self.identity.family}_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            initialfile=f"{sample}_{datetime.now():%Y%m%d_%H%M%S}.csv",
         )
         if not path:
             return
-        headers = ["channel", "ambient"]
+        self._write_current_csv(Path(path))
+        self.log("SYS", self._tr(
+            f"当前数据已导出：{path}", f"Current data exported: {path}"))
+
+    def _write_current_csv(self, path: Path) -> None:
+        mode = self._display_mode_code()
+        headers = ["channel", "nominal_wavelength_nm", "ambient"]
         for light in LIGHTS:
-            headers += [f"{light}_light", f"{light}_dark", f"{light}_net"]
-        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            headers += [
+                f"{light}_light", f"{light}_dark", f"{light}_net",
+                f"{light}_processed", f"{light}_gain_x1000", f"{light}_tint_us",
+                f"{light}_temperature_c", f"{light}_flags",
+            ]
+        with path.open("w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.writer(handle)
+            writer.writerow(["application", f"{APP_NAME_EN} {APP_VERSION}"])
+            writer.writerow(["exported_at", datetime.now().astimezone().isoformat()])
+            writer.writerow(["experiment_name", self.experiment_name_var.get().strip()])
+            writer.writerow(["sample_id", self.sample_id_var.get().strip()])
+            writer.writerow(["operator", self.operator_var.get().strip()])
+            writer.writerow(["notes", self.notes_var.get().strip()])
+            writer.writerow(["scan_average_count", self.last_average_count])
+            writer.writerow(["display_mode", mode])
+            writer.writerow(["reference_valid", int(self._reference_is_valid())])
             writer.writerow(["sensor_family", self.identity.family])
             writer.writerow(["sensor_candidates", self.identity.candidates])
             writer.writerow(["sensor_protocol", self.identity.protocol])
@@ -1537,21 +2173,109 @@ class AmsSpectralApp:
             writer.writerow(["effective_profile", self.identity.effective_profile])
             writer.writerow(["profile_ambiguous", self.identity.profile_ambiguous])
             writer.writerow(["i2c_address", self.identity.address])
+            writer.writerow(["firmware_version", self.identity.firmware])
+            writer.writerow(["protocol_version", self.identity.protocol_version])
             writer.writerow([])
             writer.writerow(headers)
             for idx, name in enumerate(self.channels):
-                row: list[Any] = [name, self._safe_at(self.ambient, idx)]
+                row: list[Any] = [name, self._channel_peak_nm(name) or "",
+                                  self._safe_at(self.ambient, idx)]
                 for light in LIGHTS:
                     frame = self.measurements.get(light)
                     if frame:
+                        processed = self._processed_values(self.measurements, light, mode)
                         row += [self._safe_at(frame.light, idx),
                                 self._safe_at(frame.dark, idx),
-                                self._safe_at(frame.net, idx)]
+                                self._safe_at(frame.net, idx),
+                                ("" if not math.isfinite(processed[idx]) else processed[idx]),
+                                frame.gain_x1000, frame.tint_us,
+                                frame.temperature_x10 / 10.0,
+                                f"0x{(frame.light_flags | frame.dark_flags):02X}"]
                     else:
-                        row += ["", "", ""]
+                        row += ["", "", "", "", "", "", "", ""]
                 writer.writerow(row)
+
+    def export_records_csv(self) -> None:
+        selected = set(self.records_tree.selection())
+        if selected:
+            selected_ids = {self._parse_int(item.removeprefix("record_"), -1)
+                            for item in selected}
+            records = [record for record in self.experiment_records
+                       if record.record_id in selected_ids]
+        else:
+            records = list(self.experiment_records)
+        if not records:
+            messagebox.showinfo(
+                self._tr("实验记录", "Experiment records"),
+                self._tr("尚无实验记录。", "There are no experiment records."))
+            return
+        path = filedialog.asksaveasfilename(
+            title=self._tr("导出实验记录", "Export experiment records"),
+            defaultextension=".csv",
+            filetypes=[(self._tr("CSV 文件", "CSV files"), "*.csv")],
+            initialfile=f"experiment_records_{datetime.now():%Y%m%d_%H%M%S}.csv",
+        )
+        if not path:
+            return
+        self._write_records_csv(Path(path), records)
         self.log("SYS", self._tr(
-            f"当前数据已导出：{path}", f"Current data exported: {path}"))
+            f"实验记录已导出：{path}", f"Experiment records exported: {path}"))
+
+    def _write_records_csv(self, path: Path, records: list[ExperimentRecord]) -> None:
+        mode = self._display_mode_code()
+        with path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "record_id", "timestamp", "experiment_name", "sample_id", "operator",
+                "notes", "sensor_family", "effective_profile", "average_count",
+                "source", "channel", "nominal_wavelength_nm", "light", "dark", "net",
+                "processed_mode", "processed_value", "gain_x1000", "tint_us", "flags",
+                "temperature_c",
+            ])
+            for record in records:
+                for source in LIGHTS:
+                    frame = record.frames.get(source)
+                    if frame is None:
+                        continue
+                    processed = self._record_values(record, source)
+                    for index, channel in enumerate(record.channels):
+                        value = processed[index] if index < len(processed) else math.nan
+                        writer.writerow([
+                            record.record_id, record.timestamp.astimezone().isoformat(),
+                            record.experiment_name, record.sample_id, record.operator,
+                            record.notes, record.sensor_family, record.effective_profile,
+                            record.average_count, source, channel,
+                            self._channel_peak_nm(channel) or "",
+                            self._safe_at(frame.light, index), self._safe_at(frame.dark, index),
+                            self._safe_at(frame.net, index), mode,
+                            "" if not math.isfinite(value) else value,
+                            frame.gain_x1000, frame.tint_us,
+                            f"0x{(frame.light_flags | frame.dark_flags):02X}",
+                            frame.temperature_x10 / 10.0,
+                        ])
+
+    def export_current_plot(self) -> None:
+        sample = self._filename_part(self.sample_id_var.get(), "spectrum")
+        path = filedialog.asksaveasfilename(
+            title=self._tr("保存当前光谱图", "Save current spectrum plot"),
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+            initialfile=f"{sample}_{datetime.now():%Y%m%d_%H%M%S}.png",
+        )
+        if path:
+            self.spectrum_figure.savefig(path, dpi=200, bbox_inches="tight")
+            self.log("SYS", self._tr(f"光谱图已保存：{path}", f"Spectrum plot saved: {path}"))
+
+    def export_comparison_plot(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title=self._tr("保存样品对比图", "Save comparison plot"),
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+            initialfile=f"comparison_{datetime.now():%Y%m%d_%H%M%S}.png",
+        )
+        if path:
+            self.comparison_figure.savefig(path, dpi=200, bbox_inches="tight")
+            self.log("SYS", self._tr(f"对比图已保存：{path}", f"Comparison plot saved: {path}"))
 
     def export_stability_csv(self) -> None:
         if not self.measurement_history:
@@ -1577,7 +2301,8 @@ class AmsSpectralApp:
             writer.writerow([])
             writer.writerow([
                 "sequence", "timestamp", "source", "gain_index", "flags",
-                "temperature_c", "sum_net", "sum_net_at_1x", "peak_net",
+                "temperature_c", "sum_net", "sum_net_at_1x",
+                "sum_net_at_1x_per_second", "peak_net",
             ])
             for item in self.measurement_history:
                 for light in LIGHTS:
@@ -1588,7 +2313,8 @@ class AmsSpectralApp:
                             datetime.fromtimestamp(float(item.get("time", 0))).isoformat(),
                             light, metric["gain"], metric["flags"],
                             metric["temperature"], metric["sum_net"],
-                            metric["sum_net_1x"], metric["peak"],
+                            metric["sum_net_1x"], metric.get("sum_net_rate", ""),
+                            metric["peak"],
                         ])
         self.log("SYS", self._tr(
             f"稳定性数据已导出：{path}", f"Stability data exported: {path}"))
@@ -1601,6 +2327,12 @@ class AmsSpectralApp:
             self.stream_active = False
             self.stream_button.configure(text=self._tr("开始连续读取", "Start streaming"))
             return
+        if self.capture_active:
+            messagebox.showinfo(
+                self._tr("实时采集", "Live acquisition"),
+                self._tr("请先停止正在进行的重复平均采集。",
+                         "Stop the active averaged acquisition first."))
+            return
         try:
             interval = max(100, int(self.stream_interval_var.get()))
         except ValueError:
@@ -1611,6 +2343,9 @@ class AmsSpectralApp:
         self.send_command(f"STREAM {interval}")
 
     def set_autogain(self) -> None:
+        self.clear_reference(self._tr(
+            "自动增益设置已改变，参考谱已清除。",
+            "The auto-gain setting changed; the reference was cleared."))
         self.send_command(f"SET AUTOGAIN {1 if self.autogain_var.get() else 0}")
 
     def set_gain(self) -> None:
@@ -1618,6 +2353,9 @@ class AmsSpectralApp:
             index = GAIN_LABELS.index(self.gain_var.get())
         except ValueError:
             index = 5
+        self.clear_reference(self._tr(
+            "增益设置已改变，参考谱已清除。",
+            "The gain setting changed; the reference was cleared."))
         self.send_command(f"SET GAIN {index}")
 
     def set_atime(self) -> None:
@@ -1629,6 +2367,9 @@ class AmsSpectralApp:
             messagebox.showwarning(
                 "ATIME", self._tr("ATIME 必须为 0～255。", "ATIME must be between 0 and 255."))
             return
+        self.clear_reference(self._tr(
+            "积分时间已改变，参考谱已清除。",
+            "The integration time changed; the reference was cleared."))
         self.send_command(f"SET ATIME {value}")
 
     def set_astep(self) -> None:
@@ -1640,6 +2381,9 @@ class AmsSpectralApp:
             messagebox.showwarning(
                 "ASTEP", self._tr("ASTEP 必须为 1～65534。", "ASTEP must be between 1 and 65534."))
             return
+        self.clear_reference(self._tr(
+            "积分时间已改变，参考谱已清除。",
+            "The integration time changed; the reference was cleared."))
         self.send_command(f"SET ASTEP {value}")
 
     @staticmethod
